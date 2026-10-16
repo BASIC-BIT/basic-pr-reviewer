@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { z } from 'zod';
-import { bundleSchema, manifestSchema, plannedPassSchema, repoPolicySchema, reviewIdentitySchema } from './contracts.js';
+import { bundleSchema, manifestSchema, plannedPassSchema, repoPolicySchema, reviewIdentitySchema, timestampSchema } from './contracts.js';
 import type { Ancestry, Bundle, BundleDescriptor, Manifest, PathIdentity, PlannedPass, ReviewIdentity, ReviewUnit, TrustedPolicy } from './contracts.js';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -27,6 +27,32 @@ type SourceOptions = {
 type Snapshot = { manifest: Manifest; policy: TrustedPolicy; blobs: Map<string, Buffer>;
   patches: Map<string, Buffer>; files: Map<string, Buffer>; context: { path: PathIdentity; blob: string; mode: string }[] };
 class SourceError extends Error { constructor(readonly code: string) { super(code); } }
+export type SourceRetryTiming = { resetAt: number | null; retryAfterMs: number | null };
+export class SourceFailure extends Error {
+  constructor(readonly reason:
+    | { kind: 'cleanup'; retryTiming: SourceRetryTiming | null }
+    | { kind: 'rate_limit'; retryTiming: SourceRetryTiming }) {
+    super(reason.kind === 'cleanup' ? 'source_cleanup_failure' : 'source_rate_limited');
+  }
+}
+function credentialFailure(error: unknown): Error | null {
+  const parsed = z.object({ status: z.number(), rateLimited: z.boolean().optional(), response: z.object({
+    headers: z.object({ 'retry-after': z.unknown().optional(), 'x-ratelimit-reset': z.unknown().optional(), 'x-ratelimit-remaining': z.unknown().optional() }),
+  }).optional() }).safeParse(error);
+  if (!parsed.success) return null;
+  if (parsed.data.status === 401) return new SourceError('authentication_failure');
+  const headers = parsed.data.response?.headers;
+  if (parsed.data.status !== 429 && !(parsed.data.status === 403 && (parsed.data.rateLimited || headers?.['x-ratelimit-remaining'] === '0'))) return null;
+  function milliseconds(value: unknown): number | null {
+    const seconds = z.union([z.number().finite().nonnegative(), z.string().regex(/^\d+(?:\.\d+)?$/)]).safeParse(value);
+    if (!seconds.success) return null;
+    const result = timestampSchema.safeParse(Math.ceil(Number(seconds.data) * 1000));
+    return result.success ? result.data : null;
+  }
+  return new SourceFailure({ kind: 'rate_limit', retryTiming: {
+    resetAt: milliseconds(headers?.['x-ratelimit-reset']), retryAfterMs: milliseconds(headers?.['retry-after']),
+  } });
+}
 function utf8(bytes: Buffer): string | null {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return null; }
 }
@@ -185,10 +211,12 @@ export async function createSourceService(options: SourceOptions) {
   const limits = limitsSchema.parse(options.limits ?? {});
   await mkdir(options.root, { recursive: true, mode: 0o700 });
   if ((await lstat(options.root)).isSymbolicLink()) throw new Error('Unsafe source root');
-  const root = await realpath(options.root), snapshots = new Map<string, Snapshot>();
+  const root = await realpath(options.root), snapshots = new Map<string, Snapshot>(), pendingCleanup = new Set<string>();
+  let recoveryRequired = false;
   const owned = (directory: string) => dirname(resolve(directory)) === root && /^(capture|bundle)-[A-Za-z0-9]+$/.test(resolve(directory).slice(root.length + 1));
   async function destroyWorkspace(directory: string): Promise<void> {
     if (!owned(directory)) throw new Error('Not a service workspace');
+    pendingCleanup.add(directory);
     snapshots.delete(directory);
     async function writable(path: string): Promise<void> {
       const stat = await lstat(path).catch(() => null);
@@ -196,9 +224,17 @@ export async function createSourceService(options: SourceOptions) {
       await chmod(path, stat.isDirectory() ? 0o700 : 0o600);
       if (stat.isDirectory()) for (const entry of await readdir(path)) await writable(join(path, entry));
     }
-    await writable(directory);
-    await rm(directory, { recursive: true, force: true });
+    try {
+      await writable(directory);
+      await rm(directory, { recursive: true, force: true });
+      pendingCleanup.delete(directory);
+    } catch { recoveryRequired = true; throw new SourceFailure({ kind: 'cleanup', retryTiming: null }); }
   }
+  async function recoverCleanup(): Promise<void> {
+    for (const directory of pendingCleanup) await destroyWorkspace(directory);
+    recoveryRequired = false;
+  }
+  function assertAdmission(): void { if (recoveryRequired) throw new SourceFailure({ kind: 'cleanup', retryTiming: null }); }
   // Construct once at startup with a dedicated root, before starting attempts.
   for (const entry of await readdir(root)) if (owned(join(root, entry))) await destroyWorkspace(join(root, entry));
   async function diskBytes(path: string): Promise<number> {
@@ -264,9 +300,7 @@ export async function createSourceService(options: SourceOptions) {
     let token: string;
     try { token = await options.credential(identity); }
     catch (error) {
-      const status = z.object({ status: z.number() }).safeParse(error);
-      if (status.success && status.data.status === 401) throw new SourceError('authentication_failure');
-      throw error;
+      throw credentialFailure(error) ?? error;
     }
     await input.beforeCredential?.();
     input.signal?.throwIfAborted();
@@ -297,6 +331,7 @@ process.stdin.on('end', () => {
   }
 
   async function captureManifest(input: ReviewIdentity, trusted: TrustedPolicy, signal?: AbortSignal, beforeCredential?: () => Promise<void>): Promise<Manifest> {
+    assertAdmission();
     const identity = reviewIdentitySchema.parse(input), policy = repoPolicySchema.parse(trusted.policy);
     const instructions = trusted.instructions.map((item) => ({ path: item.path, hash: hash(item.text) }));
     if (instructions.some((item, index) => item.hash !== trusted.instructions[index]?.hash) ||
@@ -408,9 +443,15 @@ process.stdin.on('end', () => {
       collectBundleInputs(snapshot);
       snapshot.manifest = manifestSchema.parse(manifest); snapshots.set(workspace, snapshot); return manifest;
     } catch (error) {
-      await destroyWorkspace(workspace);
+      const failure = credentialFailure(error) ?? error;
+      try { await destroyWorkspace(workspace); }
+      catch (cleanupError) {
+        if (cleanupError instanceof SourceFailure && failure instanceof SourceFailure) throw new SourceFailure({ kind: 'cleanup', retryTiming: failure.reason.retryTiming });
+        throw cleanupError;
+      }
       if (signal?.aborted) throw new SourceError('cancelled');
-      manifest.units = []; manifest.retrievalFailures = [{ path: null, code: error instanceof SourceError ? error.code : 'retrieval_failed' }];
+      if (failure instanceof SourceFailure) throw failure;
+      manifest.units = []; manifest.retrievalFailures = [{ path: null, code: failure instanceof SourceError ? failure.code : 'retrieval_failed' }];
       for (const item of manifest.sourceMap) if (item.disposition === 'review') item.disposition = 'retrieval_failure';
       manifest.bundleInputs = []; manifest.bundleOmissions = [];
       snapshot.blobs.clear(); snapshot.patches.clear(); snapshot.files.clear(); snapshot.context = [];
@@ -426,6 +467,7 @@ process.stdin.on('end', () => {
   }
 
   async function materializeBundle(input: Manifest, unitIds: string[], signal?: AbortSignal, groupId: string | null = null): Promise<Bundle> {
+    assertAdmission();
     signal?.throwIfAborted();
     const snapshot = captured(input), descriptor = describeBundle(input, unitIds, groupId);
     const directory = await mkdtemp(join(root, 'bundle-'));
@@ -476,5 +518,6 @@ process.stdin.on('end', () => {
     verifiedAncestry.add(proof);
     return proof;
   }
-  return { captureManifest, materializeBundle, materializePass, verifyAncestry, destroyWorkspace };
+  return { captureManifest, materializeBundle, materializePass, verifyAncestry, destroyWorkspace, recoverCleanup,
+    get recoveryRequired() { return recoveryRequired; } };
 }

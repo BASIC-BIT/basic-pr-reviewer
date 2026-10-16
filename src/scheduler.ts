@@ -5,6 +5,7 @@ import { GitHubAccessError } from './github.js';
 import { aggregateReview, planCoverage, splitScope } from './passes.js';
 import { ConfigurationError } from './policy.js';
 import { RECOVERY_WINDOW_MS } from './store.js';
+import { SourceFailure } from './source.js';
 import type { createSourceService } from './source.js';
 import type { createWorker } from './worker.js';
 
@@ -23,7 +24,6 @@ export function createScheduler(options: SchedulerOptions) {
   const { store, source, worker } = options;
   let active: { claim: ClaimedAttempt; controller: AbortController } | null = null;
   let blocked = false;
-  const cleanup = new Set<string>();
 
   async function cancelPull(repositoryId: string, pullNumber: number, reason: CancellationReason): Promise<void> {
     const current = store.current(repositoryId, pullNumber), observed = store.observation(repositoryId, pullNumber);
@@ -42,7 +42,7 @@ export function createScheduler(options: SchedulerOptions) {
     if (active) throw new Error('worker_busy');
     blocked = true;
     await worker.reap();
-    for (const directory of cleanup) { await source.destroyWorkspace(directory); cleanup.delete(directory); }
+    await source.recoverCleanup();
     blocked = false;
   }
 
@@ -163,7 +163,6 @@ export function createScheduler(options: SchedulerOptions) {
       const pass = next;
       await current();
       const materialized = await source.materializePass(manifest, pass, signal);
-      cleanup.add(materialized.bundle.directory);
       let outcome: PassOutcome;
       try {
         check();
@@ -185,9 +184,10 @@ export function createScheduler(options: SchedulerOptions) {
         else retry(count, outcome.failureCode);
       } finally {
         await source.destroyWorkspace(materialized.bundle.directory);
-        cleanup.delete(materialized.bundle.directory);
       }
     } catch (error) {
+      const sourceFailure = error instanceof SourceFailure ? error.reason : null;
+      if (sourceFailure?.kind === 'cleanup') blocked = true;
       if (error instanceof GitHubAccessError) {
         await cancelPull(identity.repositoryId, identity.pullNumber, 'access_revoked');
       } else if (!signal.aborted) {
@@ -200,8 +200,10 @@ export function createScheduler(options: SchedulerOptions) {
             const headers = failure.success ? failure.data.response?.headers ?? {} : {};
             const reset = z.coerce.number().int().nonnegative().safeParse(headers['x-ratelimit-reset']);
             const after = z.coerce.number().nonnegative().safeParse(headers['retry-after']);
-            const resetAt = Math.max(reset.success ? reset.data * 1000 : 0, after.success ? options.now() + after.data * 1000 : 0);
-            retry(store.startPass(identity, 'stage_failure', owner()), 'temporary_stage_failure', resetAt);
+            const resetAt = Math.max(reset.success ? reset.data * 1000 : 0, after.success ? options.now() + after.data * 1000 : 0,
+              sourceFailure?.retryTiming?.resetAt ?? 0, options.now() + (sourceFailure?.retryTiming?.retryAfterMs ?? 0));
+            const reason = sourceFailure?.kind === 'cleanup' ? 'cleanup_failure' : sourceFailure?.kind === 'rate_limit' ? 'source_rate_limited' : 'temporary_stage_failure';
+            retry(store.startPass(identity, 'stage_failure', owner()), reason, resetAt);
           }
         }
         catch { controller.abort(); }
@@ -209,17 +211,16 @@ export function createScheduler(options: SchedulerOptions) {
     } finally {
       clearInterval(timer);
       if (manifest) {
-        cleanup.add(manifest.workspace);
-        try { await source.destroyWorkspace(manifest.workspace); cleanup.delete(manifest.workspace); }
+        try { await source.destroyWorkspace(manifest.workspace); }
         catch { blocked = true; }
       }
-      if (cleanup.size) blocked = true;
+      if (source.recoveryRequired) blocked = true;
     }
   }
 
   async function tick(now: number): Promise<void> {
     timestampSchema.parse(now);
-    if (active || blocked) return;
+    if (active || blocked || source.recoveryRequired) return;
     recoverExpiredLeases(now);
     const claim = store.claim(now);
     if (!claim) return;
@@ -228,5 +229,5 @@ export function createScheduler(options: SchedulerOptions) {
     try { await run(claim, controller); }
     finally { active = null; }
   }
-  return { tick, cancelPull, recoverExpiredLeases, recoverWorker, get recoveryRequired() { return blocked; } };
+  return { tick, cancelPull, recoverExpiredLeases, recoverWorker, get recoveryRequired() { return blocked || source.recoveryRequired; } };
 }

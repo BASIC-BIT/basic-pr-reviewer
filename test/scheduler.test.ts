@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readdir } from 'node:fs/promises';
+import { readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { openStore, LEASE_DURATION_MS, RECOVERY_WINDOW_MS } from '../src/store.js';
 import { event, outcome, spec } from './fixtures/identities.js';
 import type { Store } from '../src/contracts.js';
 import { createScheduler } from '../src/scheduler.js';
 import { createSourceService } from '../src/source.js';
-import { fixture, policy, identity, service, temp } from './fixtures/source.js';
+import { fixture, policy, identity, service, temp, git } from './fixtures/source.js';
 import type { PassOutcome, PassSpec, ReviewIdentity, LivePull } from '../src/contracts.js';
+
+vi.mock('node:fs/promises', async original => {
+  const fs = await original<typeof import('node:fs/promises')>();
+  return { ...fs, rm: vi.fn(fs.rm), writeFile: vi.fn(fs.writeFile) };
+});
+const actualFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
 
 const stores: Store[] = [];
 function ledger(path = ':memory:') { const store = openStore(path); stores.push(store); return store; }
@@ -85,7 +91,7 @@ async function setup(entries = [{ path: 'packages/alpha/index.ts', text: 'alpha\
       runPass: async (id: ReviewIdentity, pass: PassSpec, signal: AbortSignal, guard?: () => Promise<void>) => {
         await guard?.(); signal.throwIfAborted(); calls.push(pass); return run(id, pass);
       } } };
-  return { ports, root, path, store, id: admitted.identity, calls, pull, commit: f.commit,
+  return { ports, root, path, store, id: admitted.identity, calls, pull, remote: f, commit: f.commit,
     scheduler: createScheduler(ports), setRun: (fn: typeof run) => { run = fn; }, advance: (ms: number) => { now += ms; }, now: () => now };
 }
 
@@ -299,22 +305,24 @@ describe('ledger scheduler', { timeout: 120000 }, () => {
   });
 
   it('preserves completed progress and stops admission when source cleanup fails', async () => {
-    const f = await setup(), destroy = f.ports.source.destroyWorkspace;
+    const f = await setup();
     let fail = true;
-    f.ports.source.destroyWorkspace = async directory => {
-      if (fail && directory.includes('bundle-')) { fail = false; throw new Error('synthetic cleanup failure'); }
-      await destroy(directory);
-    };
-    await f.scheduler.tick(f.now()); await f.scheduler.tick(f.now());
-    expect(f.calls).toHaveLength(1);
-    expect(f.scheduler.recoveryRequired).toBe(true);
-    expect(f.store.current(f.id.repositoryId, f.id.pullNumber)?.passes[0]?.outcome.status).toBe('completed');
-    await f.scheduler.recoverWorker();
-    expect(f.scheduler.recoveryRequired).toBe(false);
-    expect(await readdir(f.root)).toEqual([]);
-    await f.scheduler.tick(f.now());
-    expect(f.calls).toHaveLength(2);
-    expect(new Set(f.calls.map(pass => pass.id)).size).toBe(2);
+    vi.mocked(rm).mockImplementation(async (path, options) => {
+      if (fail && String(path).startsWith(f.root) && /[\\/]bundle-/.test(String(path))) { fail = false; throw new Error('synthetic cleanup failure'); }
+      await actualFs.rm(path, options);
+    });
+    try {
+      await f.scheduler.tick(f.now()); await f.scheduler.tick(f.now());
+      expect(f.calls).toHaveLength(1);
+      expect(f.scheduler.recoveryRequired).toBe(true);
+      expect(f.store.current(f.id.repositoryId, f.id.pullNumber)?.passes[0]?.outcome.status).toBe('completed');
+      await f.scheduler.recoverWorker();
+      expect(f.scheduler.recoveryRequired).toBe(false);
+      expect(await readdir(f.root)).toEqual([]);
+      await f.scheduler.tick(f.now());
+      expect(f.calls).toHaveLength(2);
+      expect(new Set(f.calls.map(pass => pass.id)).size).toBe(2);
+    } finally { vi.mocked(rm).mockImplementation(actualFs.rm); }
   });
 
   it('keeps a guarded credential-read authentication failure visible even if a worker sanitizes it', async () => {
@@ -374,5 +382,77 @@ describe('ledger scheduler', { timeout: 120000 }, () => {
     expect(credential).toHaveBeenCalledOnce();
     expect(f.calls).toEqual([]);
     expect(f.store.current(f.id.repositoryId, f.id.pullNumber)).toMatchObject({ state: 'intervention', interventionReason: 'authentication_failure' });
+  });
+
+  it.each(['capture', 'materialize'] as const)('blocks admission when internal %s cleanup fails before returning ownership', async stage => {
+    const f = await setup(), root = await temp();
+    let failOperation = true, holdCleanup = true, writes = 0, captures = 0;
+    const source = await createSourceService({ root, fetch: async ({ directory, identity }) => {
+      captures++;
+      if (stage === 'capture' && failOperation) throw new Error('PRIVATE_CAPTURE_DIAGNOSTIC');
+      const pack = git(f.remote.directory, ['pack-objects', '--stdout', '--revs'], `${identity.baseSha}\n${identity.headSha}\n`);
+      git(directory, ['index-pack', '--stdin'], pack);
+    } });
+    const ownedKind = stage === 'capture' ? /[\\/]capture-/ : /[\\/]bundle-/;
+    vi.mocked(rm).mockImplementation(async (path, options) => {
+      if (holdCleanup && String(path).startsWith(root) && ownedKind.test(String(path))) throw new Error('PRIVATE_CLEANUP_DIAGNOSTIC');
+      await actualFs.rm(path, options);
+    });
+    vi.mocked(writeFile).mockImplementation(async (path, data, options) => {
+      if (stage === 'materialize' && failOperation && String(path).startsWith(root) && /[\\/]bundle-/.test(String(path)) && ++writes === 2) throw new Error('PRIVATE_WRITE_DIAGNOSTIC');
+      await actualFs.writeFile(path, data, options);
+    });
+    const scheduler = createScheduler({ ...f.ports, source });
+    await actualFs.writeFile(join(root, 'unrelated.txt'), 'must be preserved');
+    try {
+      await scheduler.tick(f.now());
+      expect(scheduler.recoveryRequired).toBe(true);
+      expect(await readdir(root)).toHaveLength(2);
+      f.advance(60000); await scheduler.tick(f.now());
+      expect(captures).toBe(1); expect(f.calls).toEqual([]);
+      await expect(source.captureManifest(f.id, policy())).rejects.toThrow('source_cleanup_failure');
+      expect(captures).toBe(1);
+      await expect(scheduler.recoverWorker()).rejects.toThrow('source_cleanup_failure');
+      expect(scheduler.recoveryRequired).toBe(true);
+      expect(await readdir(root)).toHaveLength(2);
+      holdCleanup = false; failOperation = false;
+      await scheduler.recoverWorker();
+      expect(await readdir(root)).toEqual(['unrelated.txt']);
+      expect(scheduler.recoveryRequired).toBe(false);
+      await scheduler.tick(f.now());
+      expect(captures).toBe(2); expect(f.calls).toHaveLength(1);
+      expect(await readdir(root)).toEqual(['unrelated.txt']);
+    } finally {
+      holdCleanup = false;
+      vi.mocked(rm).mockImplementation(actualFs.rm);
+      vi.mocked(writeFile).mockImplementation(actualFs.writeFile);
+    }
+  });
+
+  it.each([false, true])('persists an authoritative source credential reset through restart without premature retries or raw metadata, cleanup failure: %s', async failCleanup => {
+    const f = await setup(), root = await temp(), resetAt = f.now() + 1200000;
+    const credential = vi.fn(async (): Promise<string> => { throw {
+      status: 429, message: 'PRIVATE_PROVIDER_MESSAGE', credential: 'PRIVATE_CREDENTIAL',
+      response: { headers: { 'x-ratelimit-reset': String(resetAt / 1000), 'retry-after': '1200', authorization: 'PRIVATE_HEADER' } },
+    }; });
+    const source = await createSourceService({ root, credential });
+    vi.mocked(rm).mockImplementation(async (path, options) => {
+      if (failCleanup && String(path).startsWith(root) && /[\\/]capture-/.test(String(path))) { failCleanup = false; throw new Error('PRIVATE_CLEANUP_DIAGNOSTIC'); }
+      await actualFs.rm(path, options);
+    });
+    try {
+      await createScheduler({ ...f.ports, source }).tick(f.now());
+      expect(f.store.current(f.id.repositoryId, f.id.pullNumber)?.nextAttemptAt).toBe(resetAt);
+      f.store.close();
+      const reopened = ledger(f.path), restarted = createScheduler({ ...f.ports, store: reopened, source });
+      if (source.recoveryRequired) await restarted.recoverWorker();
+      f.advance(60000); await restarted.tick(f.now());
+      expect(credential).toHaveBeenCalledOnce();
+      f.advance(1140000); await restarted.tick(f.now());
+      expect(credential).toHaveBeenCalledTimes(2);
+      const serialized = JSON.stringify({ current: reopened.current(f.id.repositoryId, f.id.pullNumber), intents: reopened.publications(f.id.repositoryId, f.id.pullNumber) });
+      for (const secret of ['PRIVATE_PROVIDER_MESSAGE', 'PRIVATE_CREDENTIAL', 'PRIVATE_HEADER', 'authorization', 'retry-after']) expect(serialized).not.toContain(secret);
+      expect(f.calls).toEqual([]); expect(await readdir(root)).toEqual([]);
+    } finally { vi.mocked(rm).mockImplementation(actualFs.rm); }
   });
 });

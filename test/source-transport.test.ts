@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { repoPolicySchema } from '../src/contracts.js';
 import type { ReviewIdentity, TrustedPolicy } from '../src/contracts.js';
-import { createSourceService } from '../src/source.js';
+import { createSourceService, SourceFailure } from '../src/source.js';
 
 vi.mock('node:child_process', async (original) => {
   const module = await original<typeof import('node:child_process')>();
@@ -57,6 +57,24 @@ it('checks the claimed identity after asynchronous setup and before resolving a 
     await Promise.resolve(); controller.abort(); controller.signal.throwIfAborted();
   })).rejects.toThrow('cancelled');
   expect(credential).not.toHaveBeenCalled();
+  expect(await readdir(root)).toEqual([]);
+});
+it.each([
+  { name: 'numeric reset headers', status: 429, rateLimited: false, headers: { 'x-ratelimit-reset': '1201', 'retry-after': '1200' }, expected: { resetAt: 1201000, retryAfterMs: 1200000 } },
+  { name: 'invalid timing stays unknown', status: 429, rateLimited: false, headers: { 'x-ratelimit-reset': 'SECRET_RAW_RESET', 'retry-after': 'Infinity' }, expected: { resetAt: null, retryAfterMs: null } },
+  { name: 'explicit secondary rate limit', status: 403, rateLimited: true, headers: { 'retry-after': '1200' }, expected: { resetAt: null, retryAfterMs: 1200000 } },
+])('exports only sanitized source rate timing for $name', async ({ status, rateLimited, headers, expected }) => {
+  const root = await mkdtemp(join(process.cwd(), 'reviewer-test-source-rate-')); roots.push(root);
+  const source = await createSourceService({ root, credential: async () => { throw {
+    status, rateLimited, message: 'SECRET_RAW_MESSAGE', credential: 'SECRET_CREDENTIAL',
+    response: { headers: { ...headers, authorization: 'SECRET_HEADER' } },
+  }; } });
+  const failure: unknown = await source.captureManifest(identity, trusted).then(() => null, error => error);
+  expect(failure).toBeInstanceOf(SourceFailure);
+  if (!(failure instanceof SourceFailure)) throw new Error('Missing safe source failure');
+  expect(failure.reason).toEqual({ kind: 'rate_limit', retryTiming: expected });
+  expect(failure.message).toBe('source_rate_limited');
+  expect(JSON.stringify(failure)).not.toContain('SECRET');
   expect(await readdir(root)).toEqual([]);
 });
 it.skipIf(process.env.REVIEWER_HOST_GIT_TEST !== '1')('launches the real Git credential helper with only synthetic credentials and rejects another host', async () => {
