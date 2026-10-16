@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, statSync } from 'node:fs';
-import { createSourceService } from '../../dist/source.js';
+import { createSourceService, navigationAlias } from '../../dist/source.js';
 import { repoPolicySchema } from '../../dist/contracts.js';
 import { planCoverage } from '../../dist/passes.js';
+import { passPrompt } from '../../dist/worker.js';
 
 assert.equal(process.getuid(), 1000);
 const remote = '/handoff/remote.git';
@@ -30,12 +31,13 @@ const source = await createSourceService({ root: '/handoff/source', fetch: async
 const manifest = await source.captureManifest(identity, trusted);
 const pass = planCoverage(manifest, [], await source.verifyAncestry(manifest, [])).freshPasses.find(pass => pass.kind === 'scope');
 assert.ok(pass);
-const { bundle } = await source.materializePass(manifest, pass);
+const { bundle, spec } = await source.materializePass(manifest, pass);
 assert.equal(statSync(bundle.directory).uid, 1000);
 assert.equal(statSync(bundle.directory).mode & 0o777, 0o500);
-for (const entry of bundle.sourceMap) {
-  const stat = statSync(`${bundle.directory}/${entry.alias}`);
+const aliases = [navigationAlias, ...bundle.sourceMap.map(entry => entry.alias)];
+for (const alias of aliases) {
+  const stat = statSync(`${bundle.directory}/${alias}`);
   assert.equal(stat.uid, 1000); assert.equal(stat.mode & 0o777, 0o400);
 }
-writeFileSync('/handoff/materialized.json', JSON.stringify({ subpath: bundle.directory.slice('/handoff/'.length), aliases: bundle.sourceMap.map(entry => entry.alias) }));
+writeFileSync('/handoff/materialized.json', JSON.stringify({ subpath: bundle.directory.slice('/handoff/'.length), aliases, spec, prompt: await passPrompt(spec) }));
 await source.destroyWorkspace(manifest.workspace);

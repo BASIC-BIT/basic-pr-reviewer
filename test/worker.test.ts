@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spec as base } from './fixtures/identities.js';
 import { outcome as saved } from './fixtures/identities.js';
+import { navigationAlias, renderNavigation } from '../src/source.js';
 
 const spec = base;
 const terminal = (changes = {}) => Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', is_error: false,
@@ -14,6 +15,12 @@ const terminal = (changes = {}) => Buffer.from(JSON.stringify({ type: 'result', 
 describe('worker output boundary', () => {
   it('accepts only a successful structured result with the pinned model', () => {
     expect(validateOutcome(terminal(), spec)).toMatchObject({ status: 'completed', findings: [], model: { name: profile.model } });
+  });
+  it('accepts the pinned CLI null API status only with independently successful output', () => {
+    expect(validateOutcome(terminal({ terminal_reason: 'completed', api_error_status: null }), spec).status).toBe('completed');
+    expect(validateOutcome(terminal({ is_error: true, terminal_reason: 'api_error', api_error_status: null }), spec).status).toBe('failed');
+    expect(validateOutcome(terminal({ api_error_status: null }), spec, 1).status).toBe('failed');
+    for (const api_error_status of [399, 600, '401']) expect(validateOutcome(terminal({ api_error_status }), spec).status).toBe('failed');
   });
   it('classifies observed CLI authentication and quota metadata on nonzero exits without accepting findings', () => {
     for (const [status, code] of [[401, 'authentication_failure'], [429, 'quota_limited']] as const) {
@@ -100,6 +107,30 @@ describe('bounded fake CLI execution', () => {
 });
 
 describe('verified materialized input', () => {
+  it('bounds large integration metadata and findings by serialized UTF-8 bytes', async () => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'worker-large-')));
+    try {
+      await mkdir(join(directory, 'data')); await mkdir(join(directory, 'quarantine'));
+      const reviewUnits = Array.from({ length: 3000 }, (_, i) => ({ ...spec.reviewUnits[0]!, id: createHash('sha256').update(String(i)).digest('hex') }));
+      const sourceMap = reviewUnits.map(unit => ({ alias: `data/${unit.id}.diff.txt`, path: unit.path,
+        side: 'diff' as const, unitIds: [unit.id], contentHash: createHash('sha256').update('synthetic diff').digest('hex') }));
+      await Promise.all(sourceMap.map(entry => writeFile(join(directory, entry.alias), 'synthetic diff')));
+      const materialized = { ...spec, kind: 'integration' as const, bundlePath: directory, sourceMap,
+        reviewUnits, unitIds: reviewUnits.map(unit => unit.id),
+        priorFindings: Array.from({ length: 3000 }, (_, i) => ({ ...saved.findings[0]!, id: `current-${i}`, message: 'quoted "\\\n文'.repeat(30) })),
+        assessmentFindings: Array.from({ length: 3000 }, (_, i) => ({ ...saved.findings[0]!, id: `retained-${i}` })) };
+      await writeFile(join(directory, navigationAlias), renderNavigation(materialized));
+      const prompt = await passPrompt(materialized);
+      expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(256 * 1024);
+      expect(JSON.parse(prompt)).not.toHaveProperty('units');
+      expect(JSON.parse(prompt)).not.toHaveProperty('priorFindings');
+      const navigation = JSON.parse(renderNavigation(materialized));
+      expect(navigation.units).toEqual(reviewUnits);
+      expect(navigation.sourceMap).toEqual(sourceMap);
+      expect(navigation.priorFindings).toEqual(materialized.priorFindings);
+      expect(navigation.assessmentFindings).toEqual(materialized.assessmentFindings);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('passes 200 KiB of inert source and captured instructions through stdin, rejecting tampering and extra files', async () => {
     const directory = await realpath(await mkdtemp(join(tmpdir(), 'worker-prompt-')));
     try {
@@ -110,6 +141,7 @@ describe('verified materialized input', () => {
         sourceMap: [{ alias, path: { bytesBase64: 'YS50cw==' }, side: 'diff' as const, unitIds: spec.unitIds, contentHash: hash(text) }],
         trustedInstructions: [{ path: 'AGENTS.md', text: 'Captured trusted guidance', hash: hash('Captured trusted guidance') }] };
       await writeFile(join(directory, alias), text);
+      await writeFile(join(directory, navigationAlias), renderNavigation(materialized));
       const prompt = await passPrompt(materialized);
       expect(prompt).toContain('Captured trusted guidance');
       expect(prompt).not.toContain(directory);
@@ -122,8 +154,31 @@ describe('verified materialized input', () => {
       await writeFile(join(directory, alias), 'tampered');
       await expect(passPrompt(materialized)).rejects.toThrow('invalid_bundle');
       await writeFile(join(directory, alias), text);
+      await writeFile(join(directory, navigationAlias), 'tampered index');
+      await expect(passPrompt(materialized)).rejects.toThrow('invalid_bundle');
+      await writeFile(join(directory, navigationAlias), renderNavigation(materialized));
       await writeFile(join(directory, 'CLAUDE.md'), 'autoload must not enter mount');
       await expect(passPrompt(materialized)).rejects.toThrow('invalid_bundle');
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+  it('selects whole previews after JSON escaping and never drops required instructions', async () => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'worker-encoded-')));
+    try {
+      await mkdir(join(directory, 'data')); await mkdir(join(directory, 'quarantine'));
+      const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+      const texts = ['"\\\n'.repeat(60 * 1024), '文'.repeat(1000)];
+      const sourceMap = texts.map((text, i) => ({ alias: `data/${hash(String(i))}.diff.txt`, path: spec.reviewUnits[0]!.path,
+        side: 'diff' as const, unitIds: spec.unitIds, contentHash: hash(text) }));
+      const materialized = { ...spec, bundlePath: directory, sourceMap, initialAliases: sourceMap.map(entry => entry.alias),
+        initialBytes: texts.reduce((sum, text) => sum + Buffer.byteLength(text), 0) };
+      for (const [i, entry] of sourceMap.entries()) await writeFile(join(directory, entry.alias), texts[i]!);
+      await writeFile(join(directory, navigationAlias), renderNavigation(materialized));
+      const prompt = await passPrompt(materialized);
+      expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(profile.maxRequestBytes);
+      expect(JSON.parse(prompt).initialDiffs).toEqual([{ alias: sourceMap[1]!.alias, text: texts[1] }]);
+      const text = '文'.repeat(profile.maxRequestBytes / 2);
+      await expect(passPrompt({ ...materialized, trustedInstructions: [{ path: 'REVIEW.md', text, hash: hash(text) }] }))
+        .rejects.toThrow('request_input_limit');
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });

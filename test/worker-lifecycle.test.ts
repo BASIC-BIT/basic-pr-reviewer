@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -8,6 +8,7 @@ import type { SpawnOptionsWithoutStdio } from 'node:child_process';
 import { createWorker, profile } from '../src/worker.js';
 import { passSpecSchema } from '../src/contracts.js';
 import { event } from './fixtures/identities.js';
+import { navigationAlias, renderNavigation, passContextHash } from '../src/source.js';
 
 const fake = vi.hoisted(() => ({ reply: (_args: string[], _env: NodeJS.ProcessEnv | undefined) => ({ stdout: '', code: 0 }) }));
 vi.mock('node:child_process', async (original) => {
@@ -56,6 +57,8 @@ it('blocks admission after removal failure, then reaps before admitting again wi
     const identity = { ...event.identity, attemptId: '1', generation: 1, runtimeHash: worker.runtimeHash };
     const spec = passSpecSchema.parse({ id: 'lifecycle', kind: 'scope', unitIds: [], reviewUnits: [], sourceMap: [], trustedInstructions: [], priorFindings: [], bundlePath: bundle,
       contextHash: createHash('sha256').update(JSON.stringify({ policyHash: identity.policyHash, runtimeHash: worker.runtimeHash, files: [] })).digest('hex') });
+    spec.contextHash = passContextHash(identity, spec.sourceMap, renderNavigation(spec));
+    await writeFile(join(bundle, navigationAlias), renderNavigation(spec));
     await worker.reap();
     expect((await worker.runPass(identity, spec, new AbortController().signal)).failureCode).toBe('cleanup_failure');
     expect(calls.filter(args => args[0] === 'network' && args[1] === 'rm')).toHaveLength(2);
@@ -75,5 +78,11 @@ it('blocks admission after removal failure, then reaps before admitting again wi
     for (const args of calls.filter(args => args[0] === 'create' || args[0] === 'run' && args.includes('-d'))) {
       expect(args[args.indexOf('--log-driver') + 1]).toBe('none');
     }
+    const text = '"'.repeat(profile.maxRequestBytes), allocationCalls = calls.length;
+    const oversized = { ...spec, trustedInstructions: [{ path: 'REVIEW.md', text, hash: createHash('sha256').update(text).digest('hex') }] };
+    expect((await worker.runPass(identity, oversized, new AbortController().signal)).failureCode).toBe('request_input_limit');
+    expect(calls).toHaveLength(allocationCalls);
+    expect(credential).toHaveBeenCalledTimes(beforeCredentialCount);
+    expect(starts).toBe(2);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

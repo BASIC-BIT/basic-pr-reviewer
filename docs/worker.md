@@ -14,6 +14,10 @@ Acquire exclusive service ownership, then await `reap()` before admitting or res
 
 Call `runPass(identity, spec, signal)` only with `spec` returned by verified `source.materializePass`. Its runtime-only fields are `bundlePath`, assigned `reviewUnits`, descriptor `sourceMap`, and captured `trustedInstructions`. The bundle directory equals the sole allowed read scope. The worker checks exact inert aliases, file hashes, initial-input size and instruction hashes before mounting. The source owner must keep those files immutable until the worker exits, then destroy the bundle and capture workspace in its own `finally`. The worker removes its containers, networks, temporary home and public-CA directory. Store strips all runtime-only fields before persisting a pass.
 
+The bundle also contains `data/navigation.json`. It holds every assigned unit, original path mapping, omission, current finding and retained assessment input. It is inert evidence, grants no coverage and is not a Git source alias. Source planning, materialization and worker validation share one deterministic renderer. The context hash binds the index bytes separately from source files; the index excludes its own descriptor and pass/context IDs. Index bytes count toward the existing per-bundle limit, and the index retains the same owner-only modes as source. Index bytes and instruction text never enter stored pass records.
+
+The serialized UTF-8 stdin request is capped at 256 KiB, including JSON escaping, task text, complete trusted instructions, the navigation entrypoint and selected whole diff previews. Unselected previews remain readable in the index and remain assigned scope. Required fixed-input overflow returns `request_input_limit` before container allocation or credential retrieval. A source-plus-index overflow returns `bundle_index_limit` without truncating mappings. The scheduler records either as a failed pass, retains independently validated findings and continues other passes without retrying the deterministic failure. It cannot certify missing coverage. More navigation can require more turns. This cap excludes the separately bounded credential line, CLI-added system prompt/tool schemas/API envelope, and accumulated later-turn context; subscription capacity still requires a pilot measurement.
+
 Only exit-zero structured output can complete a pass. Trusted code checks the schema, model identity, assigned evidence, prior-finding membership and path/side/line ranges, then assigns finding IDs. Assistant fallback text never grants coverage. Failed outcomes contain safe codes and no raw stdout/stderr; their model field identifies the requested profile, not observed inference. The scheduler decides coverage and retry policy from these outcomes.
 
 ## Container and network boundary
@@ -34,10 +38,12 @@ Run these commands from the repository root on an idle development Docker daemon
 docker build -f worker/Dockerfile -t basic-pr-reviewer-worker:task5 .
 docker build -f worker/proxy.Dockerfile -t basic-pr-reviewer-proxy:task5 .
 npm run build
-node scripts/acceptance.ts --worker-profile
+node scripts/acceptance.ts --worker-profile <worker-sha256-image-id> <proxy-sha256-image-id>
 ```
 
 Acceptance uses synthetic credentials and a fixture-only HTTPS origin. It checks actual pinned CLI tools, blocked source hooks/MCP, outside-bundle reads, exact proxy routes, upstream certificate rejection, private DNS, direct host/private/metadata/public access, cancellation, orphan recovery and cleanup. It inspects Docker metadata without printing it and proves the credential and OAuth environment entry are absent while CLI authentication succeeds. The provider also checks that the credential is absent from model input. Its records contain assertions and tool names, never request bodies. Unit tests cover output validation, process limits, large stdin, credential framing, cleanup-failure recovery and metadata nonpersistence.
+
+The navigation acceptance runs the pinned CLI against an actual Linux-materialized private bundle. Its synthetic provider requests the JSON index, obtains a source alias from that tool result, then reads the cited source. It verifies those returned bytes and structured completion. Supply immutable image IDs from the trusted builds above; acceptance does not execute a moving image tag.
 
 These checks do not establish subscription entitlement, successful real inference, or production-host networking. The separately authorized hosted pilot must verify the exact image IDs and runtime hash, real subscription authentication and model identity, effective tool/policy behavior, inference-path compatibility and network denials on that host. An unexpected startup endpoint or tool blocks launch. Do not broaden paths, enable remote policy or add API-key fallback to make authentication work. No automatic token refresh or account mutation is supported.
 

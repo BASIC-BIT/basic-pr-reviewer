@@ -5,13 +5,14 @@ import { GitHubAccessError } from './github.js';
 import { aggregateReview, planCoverage, splitScope } from './passes.js';
 import { ConfigurationError } from './policy.js';
 import { RECOVERY_WINDOW_MS } from './store.js';
-import { SourceFailure } from './source.js';
+import { BundleInputLimit, SourceFailure } from './source.js';
 import type { createSourceService } from './source.js';
 import type { createWorker } from './worker.js';
 
 export type CancellationReason = 'superseded' | 'closed' | 'draft' | 'skipped' | 'access_revoked' | 'base_changed' | 'retarget' | 'policy_changed' | 'disabled' | 'fork' | 'bot_author';
 export const RETRY_DELAYS_MS = [60_000, 300_000, 900_000];
 export const HEARTBEAT_MS = 30_000;
+const inputLimit = (code: string | null | undefined) => code === 'bundle_index_limit' || code === 'request_input_limit';
 type Source = Awaited<ReturnType<typeof createSourceService>>;
 type Worker = Awaited<ReturnType<typeof createWorker>>;
 export type SchedulerOptions = {
@@ -110,6 +111,7 @@ export function createScheduler(options: SchedulerOptions) {
       if (pass.kind === 'scope' && pass.unitIds.every(id => covered.has(id))) return null;
       const saved = records().find(record => record.spec.id === pass.id);
       if (saved?.outcome.status === 'completed') return null;
+      if (inputLimit(saved?.outcome.failureCode)) return null;
       const exhausted = saved?.outcome.failureCode === 'turn_limit' || saved?.outcome.failureCode === 'timeout';
       if (exhausted && manifest && pass.kind === 'scope') {
         for (const child of splitScope(manifest, pass)) { const next = select(child, covered); if (next) return next; }
@@ -162,19 +164,31 @@ export function createScheduler(options: SchedulerOptions) {
       }
       const pass = next;
       await current();
-      const materialized = await source.materializePass(manifest, pass, signal);
+      let materialized: Awaited<ReturnType<Source['materializePass']>> | null = null;
       let outcome: PassOutcome;
       try {
         check();
         const count = store.startPass(identity, pass.id, owner());
-        await current();
-        outcome = await worker.runPass(identity, materialized.spec, signal, guard);
+        try {
+          materialized = await source.materializePass(manifest, pass, signal);
+          await current();
+          outcome = await worker.runPass(identity, materialized.spec, signal, guard);
+        } catch (error) {
+          if (!(error instanceof BundleInputLimit)) throw error;
+          outcome = { passId: pass.id, status: 'failed', failureCode: 'bundle_index_limit', findings: [], priorFindingAssessments: [],
+            model: { name: 'not_run', cliVersion: 'not_run' }, usage: { inputTokens: null, outputTokens: null } };
+        }
         if (outcome.failureCode === 'cleanup_failure' || outcome.failureCode === 'recovery_required') blocked = true;
         if ('error' in boundaryFailure) throw boundaryFailure.error;
         check();
+        if (inputLimit(outcome.failureCode)) {
+          const previous = records().find(record => record.spec.id === pass.id);
+          outcome = { ...outcome, findings: [...new Map([...(previous?.outcome.findings ?? []), ...outcome.findings].map(finding => [finding.id, finding])).values()] };
+        }
         store.savePass(identity, pass, outcome, owner());
         result = aggregateReview(identity, manifest, records());
         if (blocked) settle('queued', 'cleanup_failure');
+        else if (inputLimit(outcome.failureCode)) settle('queued', outcome.failureCode);
         else if (outcome.status === 'completed') {
           if (result.status === 'complete') settle('complete', null);
           else settle('queued', 'automatic_recovery');
@@ -183,7 +197,7 @@ export function createScheduler(options: SchedulerOptions) {
         else if (count >= 4) settle('queued', 'pass_retries_exhausted');
         else retry(count, outcome.failureCode);
       } finally {
-        await source.destroyWorkspace(materialized.bundle.directory);
+        if (materialized) await source.destroyWorkspace(materialized.bundle.directory);
       }
     } catch (error) {
       const sourceFailure = error instanceof SourceFailure ? error.reason : null;

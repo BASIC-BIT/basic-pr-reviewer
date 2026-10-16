@@ -4,8 +4,8 @@ import { spawn } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { z } from 'zod';
-import { bundleSchema, manifestSchema, plannedPassSchema, repoPolicySchema, reviewIdentitySchema, timestampSchema } from './contracts.js';
-import type { Ancestry, Bundle, BundleDescriptor, Manifest, PathIdentity, PlannedPass, ReviewIdentity, ReviewUnit, TrustedPolicy } from './contracts.js';
+import { bundleMappingSchema, bundleSchema, findingSchema, manifestSchema, plannedPassSchema, repoPolicySchema, reviewIdentitySchema, reviewUnitSchema, sourceOmissionSchema, timestampSchema } from './contracts.js';
+import type { Ancestry, Bundle, BundleDescriptor, Manifest, PassSpec, PathIdentity, PlannedPass, ReviewIdentity, ReviewUnit, TrustedPolicy } from './contracts.js';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const objectId = (type: string, bytes: Buffer) => createHash('sha1').update(`${type} ${bytes.length}\0`).update(bytes).digest('hex');
@@ -28,6 +28,7 @@ type SourceOptions = {
 type Snapshot = { manifest: Manifest; policy: TrustedPolicy; blobs: Map<string, Buffer>;
   patches: Map<string, Buffer>; files: Map<string, Buffer>; context: { path: PathIdentity; blob: string; mode: string }[] };
 class SourceError extends Error { constructor(readonly code: string) { super(code); } }
+export class BundleInputLimit extends Error { constructor() { super('bundle_index_limit'); } }
 export type SourceRetryTiming = { resetAt: number | null; retryAfterMs: number | null };
 export class SourceFailure extends Error {
   constructor(readonly reason:
@@ -132,6 +133,24 @@ export function describeBundle(manifest: Manifest, unitIds: string[], groupId: s
   const sourceMap = [...files.values()].sort((a, b) => a.alias.localeCompare(b.alias));
   const contextHash = hash(JSON.stringify({ policyHash: manifest.identity.policyHash, runtimeHash: manifest.identity.runtimeHash, files: sourceMap }));
   return { contextHash, sourceMap, omissions };
+}
+
+export const navigationAlias = 'data/navigation.json';
+// The index has no pass/context identity or index descriptor, so its hash is not self-referential.
+export function renderNavigation(spec: Pick<PassSpec, 'kind' | 'reviewUnits' | 'sourceMap' | 'omissions' | 'priorFindings' | 'assessmentFindings'>): string {
+  // Schema field order keeps captured, planned and deserialized inputs byte-identical.
+  return JSON.stringify({ version: 1, kind: spec.kind, units: spec.reviewUnits.map(unit => reviewUnitSchema.parse(unit)),
+    sourceMap: spec.sourceMap.map(entry => bundleMappingSchema.parse(entry)), omissions: spec.omissions.map(item => sourceOmissionSchema.parse(item)),
+    priorFindings: spec.priorFindings.map(finding => findingSchema.parse(finding)), assessmentFindings: (spec.assessmentFindings ?? []).map(finding => findingSchema.parse(finding)) }, null, 2);
+}
+export function passContextHash(identity: Pick<ReviewIdentity, 'policyHash' | 'runtimeHash'>, sourceMap: BundleDescriptor['sourceMap'], navigation: string): string {
+  return hash(JSON.stringify({ policyHash: identity.policyHash, runtimeHash: identity.runtimeHash, files: sourceMap,
+    navigation: { alias: navigationAlias, contentHash: hash(navigation), bytes: Buffer.byteLength(navigation) } }));
+}
+export function describePassBundle(manifest: Manifest, spec: Pick<PlannedPass, 'kind' | 'unitIds' | 'groupId' | 'priorFindings' | 'assessmentFindings'>) {
+  const descriptor = describeBundle(manifest, spec.unitIds, spec.groupId), selected = new Set(spec.unitIds);
+  const navigation = renderNavigation({ ...spec, ...descriptor, reviewUnits: manifest.units.filter(unit => selected.has(unit.id)) });
+  return { ...descriptor, contextHash: passContextHash(manifest.identity, descriptor.sourceMap, navigation), navigation };
 }
 function matches(path: PathIdentity, globs: string[]): boolean {
   const text = pathText(path);
@@ -468,13 +487,15 @@ process.stdin.on('end', () => {
     return snapshot;
   }
 
-  async function materializeBundle(input: Manifest, unitIds: string[], signal?: AbortSignal, groupId: string | null = null): Promise<Bundle> {
+  async function writeBundle(snapshot: Snapshot, descriptor: BundleDescriptor, signal?: AbortSignal, navigation?: string): Promise<Bundle> {
     assertAdmission();
     signal?.throwIfAborted();
-    const snapshot = captured(input), descriptor = describeBundle(input, unitIds, groupId);
+    const bytes = descriptor.sourceMap.reduce((total, entry) => total + (snapshot.files.get(entry.alias)?.length ?? 0), 0);
+    if (bytes + Buffer.byteLength(navigation ?? '') > snapshot.manifest.maxBundleBytes) throw new BundleInputLimit();
     const directory = await mkdtemp(join(root, 'bundle-'));
     try {
       await mkdir(join(directory, 'data')); await mkdir(join(directory, 'quarantine'));
+      if (navigation !== undefined) await writeFile(join(directory, navigationAlias), navigation, { flag: 'wx', mode: 0o400 });
       for (const entry of descriptor.sourceMap) {
         signal?.throwIfAborted();
         const bytes = snapshot.files.get(entry.alias);
@@ -486,6 +507,10 @@ process.stdin.on('end', () => {
     } catch (error) { await destroyWorkspace(directory); throw error; }
   }
 
+  async function materializeBundle(input: Manifest, unitIds: string[], signal?: AbortSignal, groupId: string | null = null): Promise<Bundle> {
+    return writeBundle(captured(input), describeBundle(input, unitIds, groupId), signal);
+  }
+
   async function materializePass(manifest: Manifest, input: PlannedPass, signal?: AbortSignal) {
     const planned = plannedPassSchema.parse(input);
     const snapshot = captured(manifest);
@@ -493,7 +518,7 @@ process.stdin.on('end', () => {
     if (planned.kind === 'integration' && (planned.groupId !== null || planned.unitIds.length !== manifest.units.length)) {
       throw new Error('Integration must include the full comparison');
     }
-    const descriptor = describeBundle(manifest, planned.unitIds, planned.groupId);
+    const { navigation, ...descriptor } = describePassBundle(manifest, planned);
     if (descriptor.contextHash !== planned.contextHash || JSON.stringify(descriptor.omissions) !== JSON.stringify(planned.omissions)) {
       throw new Error('Planned bundle descriptor mismatch');
     }
@@ -502,7 +527,7 @@ process.stdin.on('end', () => {
       planned.initialAliases.some((alias) => !diffAliases.has(alias)) ||
       planned.initialAliases.reduce((sum, alias) => sum + (snapshot.files.get(alias)?.length ?? 0), 0) !== planned.initialBytes ||
       planned.kind === 'scope' && planned.initialAliases.length !== diffAliases.size) throw new Error('Invalid initial bundle descriptor');
-    const bundle = await materializeBundle(manifest, planned.unitIds, signal, planned.groupId);
+    const bundle = await writeBundle(snapshot, descriptor, signal, navigation);
     return { spec: { ...planned, bundlePath: bundle.directory,
       reviewUnits: manifest.units.filter((unit) => planned.unitIds.includes(unit.id)), sourceMap: bundle.sourceMap,
       trustedInstructions: snapshot.policy.instructions.map((item) => ({ ...item })) }, bundle };

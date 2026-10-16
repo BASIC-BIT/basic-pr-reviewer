@@ -5,7 +5,7 @@ import { openStore, LEASE_DURATION_MS, RECOVERY_WINDOW_MS } from '../src/store.j
 import { event, outcome, spec } from './fixtures/identities.js';
 import type { Store } from '../src/contracts.js';
 import { createScheduler } from '../src/scheduler.js';
-import { createSourceService } from '../src/source.js';
+import { BundleInputLimit, createSourceService } from '../src/source.js';
 import { fixture, policy, identity, service, temp, git } from './fixtures/source.js';
 import type { PassOutcome, PassSpec, ReviewIdentity, LivePull } from '../src/contracts.js';
 
@@ -96,6 +96,34 @@ async function setup(entries = [{ path: 'packages/alpha/index.ts', text: 'alpha\
 }
 
 describe('ledger scheduler', { timeout: 120000 }, () => {
+  it.each(['request_input_limit', 'bundle_index_limit'])('saves %s once, preserves findings and continues remaining passes', async code => {
+    const f = await setup();
+    f.setRun(async (_identity, pass) => ({ ...outcome, passId: pass.id, status: 'failed', failureCode: 'temporary',
+      findings: [{ id: 'useful-partial', message: 'A supported partial finding.', severity: 'P2', location: { kind: 'summary', path: null },
+        evidence: [{ unitId: pass.unitIds[0]!, explanation: 'Inspected supplied scope.' }] }] }));
+    await f.scheduler.tick(f.now());
+    f.advance(60_000);
+    if (code === 'bundle_index_limit') vi.spyOn(f.ports.source, 'materializePass').mockRejectedValueOnce(new BundleInputLimit());
+    f.setRun(async (_identity, pass) => ({ ...outcome, passId: pass.id, findings: [], status: 'failed', failureCode: code }));
+    await f.scheduler.tick(f.now());
+    let current = f.store.current(f.id.repositoryId, f.id.pullNumber)!;
+    expect(current.result?.failureCodes).toContain(code);
+    expect(current.result?.findings.map(finding => finding.id)).toEqual(['useful-partial']);
+    expect(current.passes[0]!.outcome.failureCode).toBe(code);
+    const failedPassId = current.passes[0]!.spec.id;
+    f.setRun(async (_identity, pass) => ({ ...outcome, passId: pass.id, findings: [] }));
+    await f.scheduler.tick(f.now());
+    await f.scheduler.tick(f.now());
+    await f.scheduler.tick(f.now());
+    current = f.store.current(f.id.repositoryId, f.id.pullNumber)!;
+    expect(current.state).toBe('incomplete');
+    expect(current.result?.complete).toBe(false);
+    expect(current.result?.findings.map(finding => finding.id)).toEqual(['useful-partial']);
+    expect(current.result?.coveredUnitIds).toHaveLength(1);
+    expect(current.result?.integrationStatus).toBe('completed');
+    expect(f.store.passAttempts(f.id, failedPassId)).toBe(2);
+    expect(f.calls.at(-1)?.kind).toBe('integration');
+  });
   it('persists one scope at a time and resumes after restart without rerunning it', async () => {
     const f = await setup();
     await f.scheduler.tick(f.now());

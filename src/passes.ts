@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { manifestSchema, plannedPassSchema, reviewIdentitySchema, validatePassOutcome } from './contracts.js';
 import type { Ancestry, CoveragePlan, Manifest, PassRecord, PlannedPass, ReviewIdentity, ReviewResult } from './contracts.js';
-import { assertVerifiedAncestry, describeBundle, sourceGroup } from './source.js';
+import { assertVerifiedAncestry, describeBundle, describePassBundle, sourceGroup } from './source.js';
 
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const INITIAL_BYTES = 200 * 1024;
@@ -18,7 +18,7 @@ function makePass(manifest: Manifest, kind: PlannedPass['kind'], unitIds: string
   const shared = manifest.sourceMap.filter((item) => item.disposition !== 'excluded' &&
     (sourceGroup(item.path) === '@shared' || item.oldPath && sourceGroup(item.oldPath) !== sourceGroup(item.path)))
     .sort((a, b) => a.id.localeCompare(b.id));
-  const descriptor = describeBundle(manifest, unitIds, groupId);
+  const descriptor = describePassBundle(manifest, { kind, unitIds, groupId, priorFindings: [] });
   const groupUnits = groupId === null ? manifest.units : manifest.units.filter((unit) => groupFor(unit) === groupId);
   const scopeHash = hash({ version: 1, shared, groupUnits: groupUnits.map((unit) => unit.id).sort(), omissions: descriptor.omissions });
   let initialBytes = 0;
@@ -56,10 +56,11 @@ function currentPasses(manifest: Manifest, covered = new Set<string>()): Planned
   return result;
 }
 
-function withFindings(spec: PlannedPass, findings: PlannedPass['priorFindings'], assessments: PlannedPass['priorFindings'] = []): PlannedPass {
+function withFindings(manifest: Manifest, spec: PlannedPass, findings: PlannedPass['priorFindings'], assessments: PlannedPass['priorFindings'] = []): PlannedPass {
   const priorFindings = [...new Map(findings.map((finding) => [finding.id, finding])).values()].sort((a, b) => a.id.localeCompare(b.id));
   const assessmentFindings = [...new Map(assessments.map(finding => [finding.id, finding])).values()].sort((a, b) => a.id.localeCompare(b.id));
-  return { ...spec, id: hash({ sourcePassId: spec.id, priorFindings, assessmentFindings }), priorFindings, assessmentFindings };
+  const { contextHash } = describePassBundle(manifest, { ...spec, priorFindings, assessmentFindings });
+  return { ...spec, id: hash({ sourcePassId: spec.id, contextHash, priorFindings, assessmentFindings }), contextHash, priorFindings, assessmentFindings };
 }
 
 function compatibleIdentity(old: ReviewIdentity, current: ReviewIdentity): boolean {
@@ -125,7 +126,7 @@ export function planCoverage(input: Manifest, previous: PassRecord[], ancestry: 
       .filter(record => { try { validatePassOutcome(record.spec, record.outcome); return true; } catch { return false; } })
       .flatMap(record => record.outcome.findings).filter(finding => finding.location.path && readable.has(finding.location.path.bytesBase64) &&
         !currentFindings.some(current => current.id === finding.id));
-    freshPasses[integrationIndex] = withFindings(integration, currentFindings, retained);
+    freshPasses[integrationIndex] = withFindings(manifest, integration, currentFindings, retained);
   }
   return { freshPasses, reusedPasses, reusedPassIds: [...used],
     invalidatedPassIds: previous.filter((record) => !used.has(record.id)).map((record) => record.id),
@@ -146,7 +147,7 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
   for (const record of [...outcomes].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))) {
     if (!same(record.identity, identity) || accepted.has(record.spec.id)) continue;
     if (currentScope(manifest, record) || integration && record.spec.reusedFrom === null &&
-      validRecord(record, withFindings(integration, record.spec.priorFindings, record.spec.assessmentFindings))) accepted.set(record.spec.id, record);
+      validRecord(record, withFindings(manifest, integration, record.spec.priorFindings, record.spec.assessmentFindings))) accepted.set(record.spec.id, record);
   }
   for (const record of [...accepted.values()].filter((item) => item.spec.kind === 'scope')) {
     const spec = record.spec;
@@ -162,8 +163,8 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
   let priorFindingAssessments: NonNullable<ReviewResult['priorFindingAssessments']> = [];
   if (integration) {
     const candidates = [...accepted.values()].filter((record) => record.spec.kind === 'integration');
-    const current = candidates.find(record => record.spec.id === withFindings(integration, [...findings.values()], record.spec.assessmentFindings).id) ?? candidates[0];
-    const expected = withFindings(integration, [...findings.values()], current?.spec.assessmentFindings);
+    const current = candidates.find(record => record.spec.id === withFindings(manifest, integration, [...findings.values()], record.spec.assessmentFindings).id) ?? candidates[0];
+    const expected = withFindings(manifest, integration, [...findings.values()], current?.spec.assessmentFindings);
     for (const record of candidates) {
       for (const finding of record.outcome.findings) findings.set(finding.id, finding);
       if (record.outcome.failureCode) failureCodes.add(record.outcome.failureCode);
@@ -200,7 +201,7 @@ export function validateIntegrationInputs(input: Manifest, spec: PlannedPass): v
     return;
   }
   const base = makePass(manifest, 'integration', manifest.units.map(unit => unit.id).sort(), null);
-  if (withFindings(base, spec.priorFindings, spec.assessmentFindings).id !== spec.id) throw new Error('Integration input hash mismatch');
+  if (withFindings(manifest, base, spec.priorFindings, spec.assessmentFindings).id !== spec.id) throw new Error('Integration input hash mismatch');
   const readable = new Set(describeBundle(manifest, spec.unitIds, null).sourceMap.map(entry => entry.path.bytesBase64));
   if (spec.assessmentFindings?.some(finding => !finding.location.path || !readable.has(finding.location.path.bytesBase64)))
     throw new Error('Assessment source unavailable');

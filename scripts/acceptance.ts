@@ -7,9 +7,12 @@ import { resolve, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { cliArguments, profile, workerRuntimeHash, sandboxArguments, validateOutcome, createWorker } from '../dist/worker.js';
 import { passSpecSchema } from '../dist/contracts.js';
+import { navigationAlias, renderNavigation, passContextHash } from '../dist/source.js';
 
 assert.equal(process.argv[2], '--worker-profile');
-const worker = 'basic-pr-reviewer-worker:task5', proxy = 'basic-pr-reviewer-proxy:task5';
+const worker = process.argv[3], proxy = process.argv[4];
+assert.match(worker ?? '', /^sha256:[a-f0-9]{64}$/); assert.match(proxy ?? '', /^sha256:[a-f0-9]{64}$/);
+if (!worker || !proxy) throw new Error('Immutable worker and proxy image IDs are required');
 const prefix = `reviewer-test-${randomUUID()}`, network = `${prefix}-internal`, egress = `${prefix}-egress`, proxyName = `${prefix}-proxy`;
 const containers: string[] = [], networks: string[] = [];
 const images: string[] = [];
@@ -27,7 +30,7 @@ try {
   const workerId = docker(['image', 'inspect', worker, '--format', '{{.Id}}']);
   const proxyId = docker(['image', 'inspect', proxy, '--format', '{{.Id}}']);
   const sourceTag = `${prefix}-source-image`, volume = `${prefix}-source`;
-  docker(['build', '-q', '-t', sourceTag, '-f', 'test/fixtures/source-worker.Dockerfile', 'test/fixtures']); images.push(sourceTag);
+  docker(['build', '-q', '--build-arg', `WORKER_IMAGE=${workerId}`, '-t', sourceTag, '-f', 'test/fixtures/source-worker.Dockerfile', 'test/fixtures']); images.push(sourceTag);
   docker(['volume', 'create', volume]); volumes.push(volume);
   docker(['run', '--rm', '--network', 'none', '--user', '0:0', '--mount', `type=volume,source=${volume},target=/handoff`,
     '--entrypoint', 'node', workerId, '-e', "require('fs').chownSync('/handoff',1000,1000)"]);
@@ -145,8 +148,11 @@ try {
   assert.equal(terminal.subtype, 'success', JSON.stringify({ subtype: terminal.subtype, is_error: terminal.is_error, requests: fakeState.requests, tools: fakeState.tools }));
   assert.equal(terminal.is_error, false);
   assert.deepEqual(terminal.structured_output, { findings: [], priorFindingAssessments: [] });
-  assert.equal(validateOutcome(Buffer.from(raw), passSpecSchema.parse({ id: 'synthetic', kind: 'scope', unitIds: [], contextHash: 'a'.repeat(64),
-    bundlePath: join(temporary, 'bundle'), reviewUnits: [], sourceMap: [], trustedInstructions: [], priorFindings: [] })).status, 'completed');
+  const originalOutcome = validateOutcome(Buffer.from(raw), passSpecSchema.parse({ id: 'synthetic', kind: 'scope', unitIds: [], contextHash: 'a'.repeat(64),
+    bundlePath: join(temporary, 'bundle'), reviewUnits: [], sourceMap: [], trustedInstructions: [], priorFindings: [] }));
+  assert.equal(originalOutcome.status, 'completed', JSON.stringify({ code: originalOutcome.failureCode,
+    fields: Object.keys(terminal), apiStatusType: terminal.api_error_status === null ? 'null' : typeof terminal.api_error_status,
+    pinnedModelPresent: Object.hasOwn(terminal.modelUsage ?? {}, profile.model) }));
   assert.equal(fakeState.auth, true);
   assert.ok(fakeState.tools.includes('Read') && fakeState.tools.includes('Glob') && fakeState.tools.includes('Grep'));
   assert.ok(!fakeState.tools.includes('Bash') && !fakeState.tools.some((name: string) => name.startsWith('mcp__')));
@@ -158,8 +164,32 @@ try {
   assert.equal(fakeState.results.length, 14);
   assert.ok(fakeState.results.slice(0, 3).every((result: { isError: boolean }) => !result.isError));
   assert.ok(fakeState.results.slice(3).every((result: { isError: boolean }) => result.isError));
+  const navigationProvider = `${prefix}-navigation-provider`, navigationWorker = `${prefix}-navigation-worker`;
+  docker(['run', '-d', '--name', navigationProvider, '--network', egress, ...hardened, '--workdir', '/tmp',
+    '--env', 'SYNTHETIC_NAVIGATION=1', '--mount', `type=bind,source=${resolve('test/fixtures')},target=/fixture,readonly`,
+    '--entrypoint', 'sh', proxyId, '/fixture/fake-proxy-entrypoint.sh']); containers.push(navigationProvider);
+  docker(['network', 'connect', '--alias', 'navigation-egress', network, navigationProvider]);
+  let navigationCa = '';
+  for (let tries = 0; tries < 30 && !navigationCa; tries++) {
+    navigationCa = docker(['exec', navigationProvider, 'node', '-e', "const fs=require('fs');if(fs.existsSync('/tmp/fake-state.json'))process.stdout.write(fs.readFileSync('/tmp/ca.pem'))"]);
+    if (!navigationCa) await setTimeout(100);
+  }
+  assert.match(navigationCa, /^-----BEGIN CERTIFICATE-----/);
+  const navigationCaPath = join(temporary, 'navigation-ca.pem'); writeFileSync(navigationCaPath, navigationCa);
+  assert.ok(Buffer.byteLength(materialized.prompt) <= profile.maxRequestBytes);
+  containers.push(navigationWorker);
+  const navigationRaw = docker(['run', '--name', navigationWorker, '--log-driver', 'none', '-i', '--network', network, ...hardened,
+    '--env', 'HTTPS_PROXY=http://navigation-egress:3128', '--env', 'HTTP_PROXY=http://navigation-egress:3128', '--env', 'NODE_EXTRA_CA_CERTS=/trust/ca.pem',
+    '--mount', `type=bind,source=${navigationCaPath},target=/trust/ca.pem,readonly`,
+    '--mount', `type=volume,source=${volume},target=/bundle,volume-subpath=${materialized.subpath},readonly`,
+    workerId, ...cliArguments()], `synthetic-oauth-token\n${materialized.prompt}`);
+  const navigationState = JSON.parse(docker(['exec', navigationProvider, 'cat', '/tmp/fake-state.json']));
+  assert.equal(validateOutcome(Buffer.from(navigationRaw), passSpecSchema.parse(materialized.spec)).status, 'completed');
+  assert.equal(navigationState.navigationRead, true, JSON.stringify(navigationState)); assert.equal(navigationState.sourceAliasRead, true);
+  assert.equal(navigationState.promptCredential, false); assert.equal(navigationState.auth, true);
+  assert.equal(navigationState.requests, 3);
   const fixtureTag = `${prefix}-proxy-image`;
-  docker(['build', '-q', '-t', fixtureTag, '-f', 'test/fixtures/worker-proxy.Dockerfile', 'test/fixtures']); images.push(fixtureTag);
+  docker(['build', '-q', '--build-arg', `PROXY_IMAGE=${proxyId}`, '-t', fixtureTag, '-f', 'test/fixtures/worker-proxy.Dockerfile', 'test/fixtures']); images.push(fixtureTag);
   const fixtureId = docker(['image', 'inspect', fixtureTag, '--format', '{{.Id}}']);
   const owned = join(temporary, 'owned'), emptyBundle = join(temporary, 'inert'); mkdirSync(owned); mkdirSync(emptyBundle);
   mkdirSync(join(emptyBundle, 'data')); mkdirSync(join(emptyBundle, 'quarantine'));
@@ -179,6 +209,8 @@ try {
   const assigned = passSpecSchema.parse({ id: 'synthetic-owned', kind: 'scope', unitIds: [],
     contextHash: createHash('sha256').update(JSON.stringify({ policyHash: identity.policyHash, runtimeHash: service.runtimeHash, files: [] })).digest('hex'),
     bundlePath: emptyBundle, reviewUnits: [], sourceMap: [], trustedInstructions: [], priorFindings: [] });
+  assigned.contextHash = passContextHash(identity, assigned.sourceMap, renderNavigation(assigned));
+  writeFileSync(join(emptyBundle, navigationAlias), renderNavigation(assigned));
   assert.equal((await service.runPass(identity, assigned, new AbortController().signal)).failureCode, 'recovery_required');
   await service.reap();
   containers.splice(containers.indexOf(orphan), 1); networks.splice(networks.indexOf(orphanNetwork), 1);
@@ -202,7 +234,8 @@ try {
   process.stdout.write(`${JSON.stringify({ workerId, proxyId, runtimeHash: workerRuntimeHash(workerId, proxyId), profile,
     ...probeReport, linuxMaterializedOwnership: true, deniedPaths: 9, upstreamCertificateVerified: true, privateDnsDenied: true,
     orphanReaped: true, unrelatedResourcesPreserved: true, cancelledAllocationCleaned: true,
-    credentialAbsentFromDockerMetadata: true, credentialAbsentFromModelInput: true, fakeState, liveInference: false }, null, 2)}\n`);
+    credentialAbsentFromDockerMetadata: true, credentialAbsentFromModelInput: true, fakeState,
+    navigationState, requestBytes: Buffer.byteLength(materialized.prompt), liveInference: false }, null, 2)}\n`);
 } catch (error) {
   failed = true; throw error;
 } finally {

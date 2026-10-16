@@ -2,7 +2,9 @@ import https from 'node:https';
 import http from 'node:http';
 import net from 'node:net';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-const state = { requests: 0, paths: [], tools: [], auth: false, results: [], commandExecuted: false, secretLeaked: false, promptCredential: false };
+const state = { requests: 0, paths: [], tools: [], auth: false, results: [], commandExecuted: false, secretLeaked: false, promptCredential: false,
+  navigationRead: false, sourceAliasRead: false, sourceAlias: null, navigationParseError: false };
+const navigationMode = process.env.SYNTHETIC_NAVIGATION === '1';
 const plan = [
   ['Read', { file_path: '/bundle/probe.txt' }],
   ['Glob', { pattern: '*.txt', path: '/bundle' }],
@@ -42,9 +44,25 @@ https.createServer({ key: readFileSync('/tmp/origin.key'), cert: readFileSync('/
       .map(b => ({ id: b.tool_use_id, isError: b.is_error === true, denied: /denied|not allowed|outside|unknown|unavailable|does not exist|permission|restricted/i.test(JSON.stringify(b.content)) }));
     state.commandExecuted ||= results.some(b => JSON.stringify(b.content).includes('COMMAND_EXECUTED_SENTINEL'));
     state.secretLeaked ||= results.some(b => JSON.stringify(b.content).includes('synthetic-oauth-token'));
+    if (navigationMode) {
+      const index = results.find(result => result.tool_use_id === 'toolu_0' && !result.is_error);
+      if (index && !state.navigationRead) {
+        const content = typeof index.content === 'string' ? index.content : index.content.map(block => block.text ?? '').join('\n');
+        const text = content.replace(/^[ \t]*\d+(?:→|\t)/gm, '');
+        try {
+          const navigation = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+          state.sourceAlias = navigation.sourceMap.find(entry => entry.side === 'diff').alias;
+          state.navigationRead = navigation.units.length > 0 && navigation.sourceMap.some(entry => entry.unitIds.includes(navigation.units[0].id));
+        } catch { state.navigationParseError = true; }
+      }
+      state.sourceAliasRead ||= results.some(result => result.tool_use_id === 'toolu_1' && !result.is_error && JSON.stringify(result.content).includes('synthetic source'));
+    }
     if (request.url.startsWith('/v1/messages/count_tokens')) { response.end(JSON.stringify({ input_tokens: 5 })); save(); return; }
     const n = state.requests++;
-    const planned = plan[n];
+    const planned = navigationMode ? [
+      ['Read', { file_path: '/bundle/data/navigation.json' }],
+      ['Read', { file_path: `/bundle/${state.sourceAlias}` }],
+    ][n] : plan[n];
     const structured = state.tools.find(name => /structured/i.test(name));
     const block = planned ? { type: 'tool_use', id: `toolu_${n}`, name: planned[0], input: planned[1] }
       : structured ? { type: 'tool_use', id: `toolu_${n}`, name: structured, input: { findings: [], priorFindingAssessments: [] } }

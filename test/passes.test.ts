@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { Manifest, PassRecord, PlannedPass } from '../src/contracts.js';
 import { aggregateReview, planCoverage, splitScope } from '../src/passes.js';
 import { fixture, policy, identity, service } from './fixtures/source.js';
+import { describePassBundle, navigationAlias, renderNavigation } from '../src/source.js';
+import { passPrompt } from '../src/worker.js';
 
 function record(m: Manifest, spec: PlannedPass, failed = false): PassRecord {
   return { id: spec.id, identity: m.identity, spec, createdAt: 1, updatedAt: 1,
@@ -35,6 +37,15 @@ describe('trusted coverage planning', { timeout: 120000 }, () => {
     expect(integration.assessmentFindings).toEqual(old.outcome.findings);
     const runnable = await source.materializePass(current, integration);
     expect(runnable.spec.assessmentFindings).toEqual(old.outcome.findings);
+    const changedAssessment = { ...integration, assessmentFindings: integration.assessmentFindings!.map(finding => ({ ...finding, message: 'Changed retained assessment' })) };
+    expect(describePassBundle(current, changedAssessment).contextHash).not.toBe(integration.contextHash);
+    expect(describePassBundle(current, integration).contextHash).toBe(integration.contextHash);
+    const reversed = { ...runnable.spec, reviewUnits: runnable.spec.reviewUnits.map(({ diffBytes, ...unit }) => ({ diffBytes, ...unit })) };
+    expect(renderNavigation(reversed)).toBe(renderNavigation(runnable.spec));
+    expect(JSON.parse(renderNavigation(runnable.spec))).not.toHaveProperty('contextHash');
+    expect(runnable.spec.sourceMap.some(entry => entry.alias === navigationAlias)).toBe(false);
+    expect(await readFile(join(runnable.bundle.directory, navigationAlias), 'utf8')).toBe(renderNavigation(runnable.spec));
+    expect(JSON.parse(await passPrompt(runnable.spec)).navigation).toBe(`/bundle/${navigationAlias}`);
     await expect(source.materializePass(current, { ...integration, assessmentFindings: [] })).rejects.toThrow(/input hash/);
     const completed = record(current, integration); completed.outcome.findings = [];
     completed.outcome.priorFindingAssessments = [{ findingId: old.outcome.findings[0]!.id, assessment: 'fixed' }];
@@ -42,6 +53,18 @@ describe('trusted coverage planning', { timeout: 120000 }, () => {
     expect(result.complete).toBe(true); expect(result.findings).toEqual([]);
     expect(result.priorFindingAssessments).toEqual(completed.outcome.priorFindingAssessments);
     expect(result.coveredUnitIds).not.toContain(scope.unitIds[0]);
+  });
+  it('counts navigation bytes in the bundle limit without truncating mappings or rejecting planning', async () => {
+    const f = await fixture([], [entries[0]!]), p = policy({ contextMode: 'diff' });
+    const { source } = await service(f, { maxBundleBytes: 500 });
+    const m = await source.captureManifest(identity(f, p), p);
+    const plan = planCoverage(m, [], await source.verifyAncestry(m, []));
+    const pass = plan.freshPasses[0]!;
+    expect(pass.omissions).toEqual([]);
+    const descriptor = describePassBundle(m, pass);
+    expect(Buffer.byteLength(descriptor.navigation)).toBeGreaterThan(m.maxBundleBytes);
+    expect(JSON.parse(descriptor.navigation).units).toEqual(m.units);
+    await expect(source.materializePass(m, pass)).rejects.toThrow('bundle_index_limit');
   });
   it('materializes only captured trusted instruction content, independent of caller mutation', async () => {
     const neighbor = { path: 'private/context.ts', text: 'context must stay excluded' };
