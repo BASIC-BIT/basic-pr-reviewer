@@ -77,6 +77,32 @@ it.each([
   expect(JSON.stringify(failure)).not.toContain('SECRET');
   expect(await readdir(root)).toEqual([]);
 });
+it('recognizes credential authentication status without optional response headers', async () => {
+  const root = await mkdtemp(join(process.cwd(), 'reviewer-test-source-auth-')); roots.push(root);
+  const source = await createSourceService({ root, credential: async () => { throw {
+    status: 401, response: {}, rateLimited: 'SECRET_BAD_FLAG', message: 'SECRET_RAW_MESSAGE',
+  }; } });
+  const manifest = await source.captureManifest(identity, trusted);
+  expect(manifest.retrievalFailures).toEqual([{ path: null, code: 'authentication_failure' }]);
+  expect(JSON.stringify(manifest)).not.toContain('SECRET');
+  expect(await readdir(root)).toEqual([]);
+});
+it.each([
+  { name: 'missing headers', diagnostics: { response: {} }, expected: { resetAt: null, retryAfterMs: null } },
+  { name: 'malformed diagnostics', diagnostics: { rateLimited: 'SECRET_BAD_FLAG', response: { headers: null } }, expected: { resetAt: null, retryAfterMs: null } },
+  { name: 'usable timing with a malformed flag', diagnostics: { rateLimited: 'SECRET_BAD_FLAG', response: { headers: { 'retry-after': '1200' } } }, expected: { resetAt: null, retryAfterMs: 1200000 } },
+])('recognizes credential rate-limit status with $name', async ({ diagnostics, expected }) => {
+  const root = await mkdtemp(join(process.cwd(), 'reviewer-test-source-status-')); roots.push(root);
+  const source = await createSourceService({ root, credential: async () => { throw {
+    status: 429, ...diagnostics, message: 'SECRET_RAW_MESSAGE', credential: 'SECRET_CREDENTIAL',
+  }; } });
+  const failure: unknown = await source.captureManifest(identity, trusted).then(() => null, error => error);
+  expect(failure).toBeInstanceOf(SourceFailure);
+  if (!(failure instanceof SourceFailure)) throw new Error('Missing safe source failure');
+  expect(failure.reason).toEqual({ kind: 'rate_limit', retryTiming: expected });
+  expect(JSON.stringify(failure)).not.toContain('SECRET');
+  expect(await readdir(root)).toEqual([]);
+});
 it.skipIf(process.env.REVIEWER_HOST_GIT_TEST !== '1')('launches the real Git credential helper with only synthetic credentials and rejects another host', async () => {
   expect(await checkTransport(true)).toContain('password=synthetic-secret-token');
   expect(await checkTransport(true, 'untrusted.invalid')).not.toContain('synthetic-secret-token');

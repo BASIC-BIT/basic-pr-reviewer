@@ -374,14 +374,27 @@ describe('ledger scheduler', { timeout: 120000 }, () => {
     expect(current?.result?.failureCodes).toContain('retrieval_failed');
   });
 
-  it('stops a Git credential authentication failure before any fetch or model inference', async () => {
+  it.each([undefined, {}])('stops a Git credential authentication failure before inference with response %j', async response => {
     const f = await setup();
-    const credential = vi.fn(async (): Promise<string> => { throw { status: 401 }; });
+    const credential = vi.fn(async (): Promise<string> => { throw { status: 401, response, message: 'SECRET_AUTH_MESSAGE' }; });
     const source = await createSourceService({ root: await temp(), credential });
     await createScheduler({ ...f.ports, source }).tick(f.now());
     expect(credential).toHaveBeenCalledOnce();
     expect(f.calls).toEqual([]);
     expect(f.store.current(f.id.repositoryId, f.id.pullNumber)).toMatchObject({ state: 'intervention', interventionReason: 'authentication_failure' });
+    expect(JSON.stringify(f.store.publications(f.id.repositoryId, f.id.pullNumber))).not.toContain('SECRET_AUTH_MESSAGE');
+  });
+
+  it('uses finite backoff for a credential 429 with missing diagnostics and unknown timing', async () => {
+    const f = await setup();
+    const credential = vi.fn(async (): Promise<string> => { throw { status: 429, response: {}, message: 'SECRET_QUOTA_MESSAGE' }; });
+    const source = await createSourceService({ root: await temp(), credential }), scheduler = createScheduler({ ...f.ports, source });
+    await scheduler.tick(f.now());
+    expect(f.store.current(f.id.repositoryId, f.id.pullNumber)).toMatchObject({ state: 'queued', interventionReason: 'source_rate_limited', nextAttemptAt: f.now() + 60000, result: null });
+    await scheduler.tick(f.now());
+    expect(credential).toHaveBeenCalledOnce();
+    expect(f.calls).toEqual([]);
+    expect(JSON.stringify(f.store.publications(f.id.repositoryId, f.id.pullNumber))).not.toContain('SECRET_QUOTA_MESSAGE');
   });
 
   it.each(['capture', 'materialize'] as const)('blocks admission when internal %s cleanup fails before returning ownership', async stage => {

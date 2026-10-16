@@ -36,13 +36,14 @@ export class SourceFailure extends Error {
   }
 }
 function credentialFailure(error: unknown): Error | null {
-  const parsed = z.object({ status: z.number(), rateLimited: z.boolean().optional(), response: z.object({
-    headers: z.object({ 'retry-after': z.unknown().optional(), 'x-ratelimit-reset': z.unknown().optional(), 'x-ratelimit-remaining': z.unknown().optional() }),
-  }).optional() }).safeParse(error);
+  const parsed = z.object({ status: z.number(), rateLimited: z.unknown().optional(), response: z.unknown().optional() }).safeParse(error);
   if (!parsed.success) return null;
   if (parsed.data.status === 401) return new SourceError('authentication_failure');
-  const headers = parsed.data.response?.headers;
-  if (parsed.data.status !== 429 && !(parsed.data.status === 403 && (parsed.data.rateLimited || headers?.['x-ratelimit-remaining'] === '0'))) return null;
+  const response = z.object({ headers: z.object({
+    'retry-after': z.unknown().optional(), 'x-ratelimit-reset': z.unknown().optional(), 'x-ratelimit-remaining': z.unknown().optional(),
+  }).optional() }).safeParse(parsed.data.response);
+  const headers = response.success ? response.data.headers : undefined;
+  if (parsed.data.status !== 429 && !(parsed.data.status === 403 && (parsed.data.rateLimited === true || headers?.['x-ratelimit-remaining'] === '0'))) return null;
   function milliseconds(value: unknown): number | null {
     const seconds = z.union([z.number().finite().nonnegative(), z.string().regex(/^\d+(?:\.\d+)?$/)]).safeParse(value);
     if (!seconds.success) return null;
