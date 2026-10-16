@@ -35,7 +35,23 @@ Unknown fields, unsupported versions, unsafe instruction paths, missing required
 | `githubLinksOnly` | `false` | Local publication restriction consumed by the renderer |
 | `instructionPaths` | `[]` | Additional trusted instruction paths, maximum 32 |
 
-Restricted repositories should retain `contextMode: "changed-context-only"` and explicitly set `githubLinksOnly: true` when required. These are separate controls. Other repositories can explicitly configure their permitted source navigation during migration. This admission module records these settings and their identity; it does not build source bundles or render output.
+Restricted repositories should retain `contextMode: "changed-context-only"` and explicitly set `githubLinksOnly: true` when required. These are separate controls. Other repositories can explicitly configure their permitted source navigation during migration.
+
+## Source capture and worker inputs
+
+Construct one `createSourceService` at startup with a dedicated host-owned temporary `root`. Startup deletes abandoned `capture-*` and `bundle-*` workspaces within that root. Pass its `credential` option the host adapter's `installationCredential` operation. That operation rechecks installation ownership and repository access, then requests a repository-scoped token with `contents: read`. Keep the adapter and temporary object store outside workers.
+
+Call `captureManifest(identity, trustedPolicy, signal?)` with the admitted immutable `ReviewIdentity`. Capture verifies the policy hash, fetches exact base/head objects into an isolated bare repository, checks object integrity, and independently verifies the unique merge base. It enumerates Git's NUL-delimited raw changes without GitHub file-list or patch limits. Exact-content renames are paired; edited renames remain explicit delete/add changes. Missing objects, ambiguous comparisons, exclusions, binary content, and resource limits never imply a clean review.
+
+`materializeBundle(manifest, unitIds, signal?)` creates a separate service-owned read-only directory. Only mount its `allowedReadScope` into the worker, as a read-only mount. Do not mount the service root or `manifest.workspace`. Its files use hashed aliases with a byte-safe original-path mapping. Symlink targets are data. Startup-like files and planted review outputs are quarantined as `.txt` data. No repository configuration or scripts execute.
+
+`diff` exposes selected diff data. `changed-context-only` also exposes the old/new contents of selected changed files. `allowlist` additionally exposes head files matching `contextAllowGlobs`. All selection happens before materialization. Globs use Git's forward-slash path semantics on every host. A non-UTF-8 name under an exclusion policy is conservatively excluded and recorded; it cannot bypass a private exclusion. The bundle's context hash covers every readable file and stable mapping plus policy/runtime hashes. Attempt IDs, head SHAs, absolute host paths, and unrelated exclusions do not enter that hash.
+
+Hunks split below 128 KiB with overlapping context and original line ranges. Single long lines use explicitly labeled byte fragments. Pass planning must include every resulting unit ID and retain explicit omissions. Binary blobs and gitlink contents are represented by metadata with omission records, rather than decoded or expanded. Defaults bound individual blobs to 16 MiB, aggregate blobs/generated diff data to 128 MiB, bundle data to 128 MiB, each Git output to 64 MiB, captured disk use to 1 GiB, and each Git command to five minutes. Disk use is sampled during Git commands and checked after fetching; the deployment should also bound the temporary volume. Limits produce missing scope while preserving other reviewable changes where enumeration remains available.
+
+The caller must invoke `destroyWorkspace` for every successful bundle and its capture workspace in `finally`, after success, failure, or cancellation. Capture failures and materialization errors remove their own partially created directories. Aborted Git commands terminate their process tree. Constructing a second service against an active root is unsupported because startup cleanup owns that root.
+
+Source tests generate synthetic bare Git objects. The default transport has a real HTTPS fetch and a process-scoped Node credential helper. `REVIEWER_HOST_GIT_TEST=1 npm test -- test/source-transport.test.ts` also exercises Git's actual helper launch using synthetic credentials, without a network request. This opt-in is needed on Windows hosts whose sandbox blocks Git's MSYS subprocesses.
 
 ## Events and reruns
 

@@ -4,3 +4,4 @@ coverage/
 .superpowers/
 *.sqlite*
 .env*
+reviewer-test-*/

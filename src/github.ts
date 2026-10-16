@@ -2,7 +2,7 @@ import { Octokit } from '@octokit/core';
 import { createAppAuth } from '@octokit/auth-app';
 import { z } from 'zod';
 import { livePullSchema } from './contracts.js';
-import type { LivePull } from './contracts.js';
+import type { LivePull, ReviewIdentity } from './contracts.js';
 
 export type InstalledRepository = { installationId: string; repositoryId: string };
 export interface GitHubPort {
@@ -14,6 +14,9 @@ export interface GitHubPort {
   readCheckRun(pull: LivePull, id: string): Promise<{ appId: string; headSha: string; pullNumbers: number[] }>;
   listRepositories(installationId: string): Promise<InstalledRepository[]>;
   listOpenPulls(installationId: string, repositoryId: string): Promise<number[]>;
+}
+export interface GitCredentialPort {
+  installationCredential(identity: Pick<ReviewIdentity, 'installationId' | 'repositoryId' | 'owner' | 'repo'>): Promise<string>;
 }
 const numericId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER).transform(String);
 const apiId = z.union([numericId, z.string().regex(/^[1-9][0-9]*$/)]);
@@ -53,7 +56,7 @@ function requestError(error: unknown): Error {
 export function createGitHubAdapter(options: {
   appId: string; privateKey: string; ownerIds: string[];
   fetch?: typeof fetch;
-}): GitHubPort {
+}): GitHubPort & GitCredentialPort {
   const settings = { authStrategy: createAppAuth, request: { fetch: options.fetch ?? fetch } };
   const app = new Octokit({ ...settings, auth: { appId: options.appId, privateKey: options.privateKey } });
   const installations = new Map<string, Octokit>();
@@ -116,6 +119,17 @@ export function createGitHubAdapter(options: {
   }
   return {
     assertInstallation,
+    async installationCredential(identity) {
+      await assertInstallation(identity.installationId);
+      const repo = await readRepository(identity.installationId, identity.repositoryId);
+      if (repo.name !== identity.repo || repo.owner.login !== identity.owner) throw new GitHubAccessError(identity.installationId, identity.repositoryId);
+      try {
+        const credential = z.object({ token: z.string().min(1) }).parse(await client(identity.installationId).auth({
+          type: 'installation', repositoryIds: [BigInt(identity.repositoryId)], permissions: { contents: 'read' },
+        }));
+        return credential.token;
+      } catch (error) { throw requestError(error); }
+    },
     async listInstallations() {
       const ids: string[] = [];
       for (let page = 1; ; page++) {

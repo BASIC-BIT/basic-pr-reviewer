@@ -10,11 +10,11 @@ const repo = { id: 200, name: 'fixture', owner: { id: 400, login: 'trusted-owner
 const live = { number: 42, state: 'open', draft: false, user: { login: 'author', type: 'User' }, labels: [],
   head: { sha: head, repo: { id: 200 } }, base: { sha: base, ref: 'main', repo: { id: 200 } } };
 function setup(handler?: (path: string) => { status: number; data: unknown; headers?: Record<string, string> } | undefined) {
-  const calls: { url: URL; auth: string | null }[] = [];
+  const calls: { url: URL; auth: string | null; body: string }[] = [];
   const transport: typeof fetch = async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
-    calls.push({ url, auth: request.headers.get('authorization') });
+    calls.push({ url, auth: request.headers.get('authorization'), body: await request.text() });
     const custom = handler?.(url.pathname);
     const data = custom?.data ?? (
       url.pathname === '/app/installations/100' ? { id: 100, suspended_at: null, account: { id: 400 } } :
@@ -31,6 +31,13 @@ function setup(handler?: (path: string) => { status: number; data: unknown; head
   return { calls, github: createGitHubAdapter({ appId: '300', privateKey: key, ownerIds: ['400'], fetch: transport }) };
 }
 describe('Octokit installation adapter with synthetic HTTP transport', () => {
+  it('provides a host-only contents-read credential scoped to the verified repository', async () => {
+    const { calls, github } = setup();
+    const credential = await github.installationCredential({ installationId: '100', repositoryId: '200', owner: 'trusted-owner', repo: 'fixture' });
+    expect(credential).toBe('synthetic-installation-token');
+    expect(JSON.parse(calls.filter((call) => call.url.pathname.endsWith('/access_tokens')).at(-1)?.body ?? '{}')).toEqual({ repository_ids: [200], permissions: { contents: 'read' } });
+    await expect(github.installationCredential({ installationId: '100', repositoryId: '200', owner: 'other-owner', repo: 'fixture' })).rejects.toThrow(GitHubAccessError);
+  });
   it('uses installation authentication, canonical repository names and exact-SHA merge-base metadata', async () => {
     const { calls, github } = setup();
     const pull = await github.readLivePull('100', '200', 42);

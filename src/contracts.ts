@@ -90,6 +90,39 @@ export const pathIdentitySchema = z.strictObject({
 });
 export type PathIdentity = z.infer<typeof pathIdentitySchema>;
 
+export const sourceMappingSchema = z.strictObject({
+  id: hashSchema, path: pathIdentitySchema, oldPath: pathIdentitySchema.nullable(),
+  oldBlobId: shaSchema.nullable(), newBlobId: shaSchema.nullable(),
+  oldMode: z.string().regex(/^[0-7]{6}$/), newMode: z.string().regex(/^[0-7]{6}$/),
+  disposition: z.enum(['review', 'excluded', 'retrieval_failure']),
+});
+export const reviewUnitSchema = z.strictObject({
+  id: hashSchema, sourceId: hashSchema, path: pathIdentitySchema, oldPath: pathIdentitySchema.nullable(),
+  oldBlobId: shaSchema.nullable(), newBlobId: shaSchema.nullable(),
+  oldLines: z.strictObject({ start: timestampSchema, count: timestampSchema }),
+  newLines: z.strictObject({ start: timestampSchema, count: timestampSchema }),
+  kind: z.enum(['text', 'rename', 'delete', 'binary', 'symlink', 'gitlink', 'mode']),
+  contentHash: hashSchema, groupId: hashSchema, diffBytes: timestampSchema,
+});
+export type ReviewUnit = z.infer<typeof reviewUnitSchema>;
+export const sourceOmissionSchema = z.strictObject({ path: pathIdentitySchema.nullable(), code: idSchema, unitIds: z.array(hashSchema).optional() });
+export const manifestSchema = z.strictObject({
+  identity: reviewIdentitySchema, units: z.array(reviewUnitSchema),
+  exclusions: z.array(sourceOmissionSchema), retrievalFailures: z.array(sourceOmissionSchema),
+  sourceMap: z.array(sourceMappingSchema), workspace: idSchema,
+});
+export type Manifest = z.infer<typeof manifestSchema>;
+export const bundleMappingSchema = z.strictObject({
+  alias: z.string().regex(/^(data|quarantine)\/[0-9a-f]{64}\.(old|new|diff)\.txt$/),
+  path: pathIdentitySchema, side: z.enum(['old', 'new', 'diff']), unitIds: z.array(hashSchema),
+  contentHash: hashSchema,
+});
+export const bundleSchema = z.strictObject({
+  directory: idSchema, contextHash: hashSchema, sourceMap: z.array(bundleMappingSchema),
+  omissions: z.array(sourceOmissionSchema), allowedReadScope: z.array(idSchema),
+});
+export type Bundle = z.infer<typeof bundleSchema>;
+
 const lineLocationSchema = z.strictObject({
   kind: z.literal('line'),
   path: pathIdentitySchema,
