@@ -17,7 +17,7 @@ const limitsSchema = z.strictObject({
   maxDiskBytes: z.number().int().positive().default(1024 * 1024 * 1024),
   gitTimeoutMs: z.number().int().positive().default(5 * 60 * 1000),
 });
-type FetchInput = { directory: string; identity: ReviewIdentity; signal?: AbortSignal };
+type FetchInput = { directory: string; identity: ReviewIdentity; signal?: AbortSignal; beforeCredential?: () => Promise<void> };
 type SourceOptions = {
   root: string; limits?: z.input<typeof limitsSchema>;
   // Host-only seams. Credentials and object stores never enter a worker bundle.
@@ -255,11 +255,21 @@ export async function createSourceService(options: SourceOptions) {
     });
   }
   async function fetchObjects(input: FetchInput): Promise<void> {
+    await input.beforeCredential?.();
+    input.signal?.throwIfAborted();
     if (options.fetch) return options.fetch(input);
     const { directory, identity, signal } = input;
     if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(identity.owner) || !/^[A-Za-z0-9_.-]+$/.test(identity.repo)) throw new SourceError('invalid_repository');
     if (!options.credential) throw new SourceError('credential_unavailable');
-    const token = await options.credential(identity);
+    let token: string;
+    try { token = await options.credential(identity); }
+    catch (error) {
+      const status = z.object({ status: z.number() }).safeParse(error);
+      if (status.success && status.data.status === 401) throw new SourceError('authentication_failure');
+      throw error;
+    }
+    await input.beforeCredential?.();
+    input.signal?.throwIfAborted();
     if (!token || /[\r\n\0]/.test(token)) throw new SourceError('credential_invalid');
     const helper = join(dirname(directory), 'credential.cjs');
     await writeFile(helper, `
@@ -286,7 +296,7 @@ process.stdin.on('end', () => {
     } finally { await rm(helper, { force: true }); }
   }
 
-  async function captureManifest(input: ReviewIdentity, trusted: TrustedPolicy, signal?: AbortSignal): Promise<Manifest> {
+  async function captureManifest(input: ReviewIdentity, trusted: TrustedPolicy, signal?: AbortSignal, beforeCredential?: () => Promise<void>): Promise<Manifest> {
     const identity = reviewIdentitySchema.parse(input), policy = repoPolicySchema.parse(trusted.policy);
     const instructions = trusted.instructions.map((item) => ({ path: item.path, hash: hash(item.text) }));
     if (instructions.some((item, index) => item.hash !== trusted.instructions[index]?.hash) ||
@@ -297,7 +307,7 @@ process.stdin.on('end', () => {
     const snapshot: Snapshot = { manifest, policy: capturedPolicy, blobs: new Map(), patches: new Map(), files: new Map(), context: [] };
     try {
       await git(directory, ['init', '--bare', '--template='], undefined, signal);
-      await fetchObjects({ directory, identity, ...(signal ? { signal } : {}) });
+      await fetchObjects({ directory, identity, ...(signal ? { signal } : {}), ...(beforeCredential ? { beforeCredential } : {}) });
       signal?.throwIfAborted();
       if (await diskBytes(workspace) > limits.maxDiskBytes) throw new SourceError('disk_limit');
       await git(directory, ['fsck', '--full', '--strict', '--no-reflogs'], undefined, signal);

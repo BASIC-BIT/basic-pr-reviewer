@@ -1,11 +1,23 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { openStore, LEASE_DURATION_MS, StaleAdmissionObservationError } from '../src/store.js';
-import type { PublicationIntent, Store } from '../src/contracts.js';
+import type { PublicationIntent, Store, ReviewIdentity, PlannedPass, PassSpec, PassOutcome } from '../src/contracts.js';
 import { event, outcome, spec } from './fixtures/identities.js';
+
+function ownership(store: Store, identity: ReviewIdentity) {
+  const current = store.current(identity.repositoryId, identity.pullNumber);
+  const claimed = current?.identity.attemptId !== identity.attemptId ? null : current.state === 'leased' ? current : store.claim(Date.now());
+  return { token: claimed?.lease.token ?? '00000000-0000-4000-8000-000000000000', now: Date.now() };
+}
+function save(store: Store, identity: ReviewIdentity, spec: PlannedPass | PassSpec, outcome: PassOutcome) {
+  store.savePass(identity, spec, outcome, ownership(store, identity));
+}
+function publish(store: Store, intent: PublicationIntent) {
+  return store.planPublication(intent, ownership(store, intent.identity));
+}
 
 describe('persistent review ledger', () => {
   let directory: string;
@@ -56,10 +68,10 @@ describe('persistent review ledger', () => {
     const store = open();
     const first = store.admit(event);
     const second = store.admit({ ...event, deliveryId: 'new-head', expectedGeneration: first.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
-    expect(() => store.savePass(first.identity, spec, outcome)).toThrow(/stale/i);
-    expect(() => store.savePass({ ...second.identity, baseSha: 'a'.repeat(40) }, spec, outcome)).toThrow(/identity/i);
+    expect(() => save(store, first.identity, spec, outcome)).toThrow(/stale/i);
+    expect(() => save(store, { ...second.identity, baseSha: 'a'.repeat(40) }, spec, outcome)).toThrow(/identity/i);
     expect(store.current('200', 42)?.passes).toEqual([]);
-    store.savePass(second.identity, spec, outcome);
+    save(store, second.identity, spec, outcome);
     expect(store.current('200', 42)?.passes).toHaveLength(1);
   });
 
@@ -72,7 +84,7 @@ describe('persistent review ledger', () => {
     expect(returned.identity.generation).toBe(second.identity.generation + 1);
     expect(returned.identity.attemptId).not.toBe(first.identity.attemptId);
     expect(store.current('200', 42)?.identity).toEqual(returned.identity);
-    expect(() => store.savePass(second.identity, spec, outcome)).toThrow(/stale/i);
+    expect(() => save(store, second.identity, spec, outcome)).toThrow(/stale/i);
     expect(store.claim(2_000)?.identity).toEqual(returned.identity);
   });
 
@@ -120,30 +132,30 @@ describe('persistent review ledger', () => {
   it('retains saved pass JSON and delivery deduplication across a close and reopen', () => {
     const firstStore = open();
     const admitted = firstStore.admit(event);
-    firstStore.savePass(admitted.identity, spec, outcome);
+    save(firstStore, admitted.identity, spec, outcome);
     firstStore.close();
     const reopened = open();
     expect(reopened.current('200', 42)).toMatchObject({
       identity: admitted.identity, passes: [{ spec: { id: spec.id, contextHash: spec.contextHash }, outcome }],
     });
     expect(reopened.admit(event)).toMatchObject({ kind: 'duplicate', identity: admitted.identity });
-    reopened.savePass(admitted.identity, spec, outcome);
+    save(reopened, admitted.identity, spec, outcome);
     expect(reopened.current('200', 42)?.passes).toHaveLength(1);
-    expect(() => reopened.savePass(admitted.identity, { ...spec, contextHash: '0'.repeat(64) }, outcome)).toThrow(/pass/i);
+    expect(() => save(reopened, admitted.identity, { ...spec, contextHash: '0'.repeat(64) }, outcome)).toThrow(/pass/i);
   });
 
   it('allows a failed pass to recover while preserving a completed result', () => {
     const store = open();
     const admitted = store.admit(event);
-    store.savePass(admitted.identity, spec, { ...outcome, status: 'failed', failureCode: 'temporary' });
-    store.savePass(admitted.identity, spec, outcome);
+    save(store, admitted.identity, spec, { ...outcome, status: 'failed', failureCode: 'temporary' });
+    save(store, admitted.identity, spec, outcome);
     expect(store.current('200', 42)?.passes[0]?.outcome).toEqual(outcome);
-    expect(() => store.savePass(admitted.identity, spec, { ...outcome, findings: [] })).toThrow(/completed pass/i);
+    expect(() => save(store, admitted.identity, spec, { ...outcome, findings: [] })).toThrow(/completed pass/i);
   });
 
   it('never persists materialized metadata or captured instruction text', () => {
     const store = open(), admitted = store.admit(event);
-    store.savePass(admitted.identity, { ...spec, trustedInstructions: [{ path: 'AGENTS.md', text: 'PRIVATE_SOURCE_SENTINEL', hash: 'a'.repeat(64) }] }, outcome);
+    save(store, admitted.identity, { ...spec, trustedInstructions: [{ path: 'AGENTS.md', text: 'PRIVATE_SOURCE_SENTINEL', hash: 'a'.repeat(64) }] }, outcome);
     const database = new DatabaseSync(path);
     try {
       const row = database.prepare('SELECT spec_json FROM passes').get();
@@ -160,6 +172,7 @@ describe('persistent review ledger', () => {
     expect(claim).not.toBeNull();
     expect(secondStore.claim(2_001)).toBeNull();
     expect(secondStore.claim(2_000 + LEASE_DURATION_MS - 1)).toBeNull();
+    secondStore.recoverExpiredLeases(2_000 + LEASE_DURATION_MS);
     const reclaimed = secondStore.claim(2_000 + LEASE_DURATION_MS);
     expect(reclaimed?.identity).toEqual(claim?.identity);
     expect(reclaimed?.lease.token).not.toBe(claim?.lease.token);
@@ -170,14 +183,14 @@ describe('persistent review ledger', () => {
     const firstStore = open();
     const first = firstStore.admit(event);
     const intent: PublicationIntent = { identity: first.identity, key: 'summary-1', channel: 'summary', body: 'Synthetic summary.' };
-    const planned = firstStore.planPublication(intent);
+    const planned = publish(firstStore, intent);
     expect(planned).toMatchObject({ state: 'planned', intent });
     firstStore.close();
     const reopened = open();
-    expect(reopened.planPublication(intent)).toEqual(planned);
-    expect(() => reopened.planPublication({ ...intent, body: 'Different summary.' })).toThrow(/publication/i);
+    expect(publish(reopened, intent)).toEqual(planned);
+    expect(() => publish(reopened, { ...intent, body: 'Different summary.' })).toThrow(/publication/i);
     reopened.admit({ ...event, deliveryId: 'rerun', expectedGeneration: first.identity.generation, trigger: { kind: 'rerun', sequence: 1 } });
-    expect(() => reopened.planPublication({ ...intent, key: 'stale-summary' })).toThrow(/stale/i);
+    expect(() => publish(reopened, { ...intent, key: 'stale-summary' })).toThrow(/stale/i);
   });
 
   it('rejects an unknown database schema version without rewriting it', () => {
@@ -189,11 +202,31 @@ describe('persistent review ledger', () => {
     expect(unchanged.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: 99 });
     unchanged.close();
   });
+  it('migrates a version 2 ledger with saved scope and delivery identity intact', () => {
+    const previous = new DatabaseSync(path);
+    previous.exec(readFileSync(new URL('./fixtures/schema-v2.sql', import.meta.url), 'utf8'));
+    const identity = { ...event.identity, attemptId: '1', generation: 1 };
+    previous.prepare('INSERT INTO pulls (repository_id, pull_number, generation, updated_at) VALUES (?, ?, 1, 1000)')
+      .run(identity.repositoryId, identity.pullNumber);
+    previous.prepare("INSERT INTO attempts (id, repository_id, pull_number, generation, work_key, identity_json, state, created_at, updated_at) VALUES (1, ?, ?, 1, 'old', ?, 'queued', 1000, 1000)")
+      .run(identity.repositoryId, identity.pullNumber, JSON.stringify(identity));
+    previous.prepare('UPDATE pulls SET current_attempt_id = 1').run();
+    const { bundlePath: _path, reviewUnits: _units, sourceMap: _map, trustedInstructions: _instructions, ...planned } = spec;
+    previous.prepare('INSERT INTO passes (attempt_id, pass_id, spec_json, outcome_json, created_at, updated_at) VALUES (1, ?, ?, ?, 1000, 1000)')
+      .run(spec.id, JSON.stringify(planned), JSON.stringify(outcome));
+    previous.prepare("INSERT INTO deliveries VALUES ('old-delivery', 1, 1000, ?)").run(JSON.stringify(event.trigger));
+    previous.close();
+    const migrated = open();
+    expect(migrated.current(identity.repositoryId, identity.pullNumber)).toMatchObject({ identity, state: 'queued', nextAttemptAt: 0, passes: [{ outcome }] });
+    expect(migrated.admit({ ...event, deliveryId: 'old-delivery' }).kind).toBe('duplicate');
+    const claim = migrated.claim(2000)!;
+    expect(migrated.startPass(identity, spec.id, { token: claim.lease.token, now: 2000 })).toBe(1);
+  });
 
   it('creates an online backup that retains saved progress', async () => {
     const store = open();
     const admitted = store.admit(event);
-    store.savePass(admitted.identity, spec, outcome);
+    save(store, admitted.identity, spec, outcome);
     const backupPath = join(directory, 'backup.sqlite');
     await store.backup(backupPath);
     const backupStore = openStore(backupPath);
@@ -223,15 +256,15 @@ describe('persistent review ledger', () => {
     ];
     for (const invalid of malformed) {
       // @ts-expect-error Malformed worker output crosses a runtime boundary despite its static type.
-      expect(() => store.savePass(admitted.identity, spec, invalid)).toThrow();
+      expect(() => save(store, admitted.identity, spec, invalid)).toThrow();
     }
     expect(store.current('200', 42)?.passes).toEqual([]);
   });
 
   it('retains identity-bound partial history without persisting temporary bundle paths', () => {
     const store = open(), first = store.admit(event);
-    store.savePass(first.identity, spec, outcome);
-    store.savePass(first.identity, { ...spec, id: 'failed-scope' }, { ...outcome, passId: 'failed-scope', status: 'failed', failureCode: 'temporary' });
+    save(store, first.identity, spec, outcome);
+    save(store, first.identity, { ...spec, id: 'failed-scope' }, { ...outcome, passId: 'failed-scope', status: 'failed', failureCode: 'temporary' });
     store.admit({ ...event, deliveryId: 'second-head', expectedGeneration: 1, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
     const history = store.passHistory('200', 42);
     expect(history).toHaveLength(2);
@@ -246,14 +279,14 @@ describe('persistent review ledger', () => {
   it('rejects otherwise valid findings whose evidence is outside the assigned units', () => {
     const store = open(), admitted = store.admit(event);
     const finding = outcome.findings[0]!;
-    expect(() => store.savePass(admitted.identity, spec, { ...outcome,
+    expect(() => save(store, admitted.identity, spec, { ...outcome,
       findings: [{ ...finding, evidence: [{ unitId: 'other-unit', explanation: 'Outside scope.' }] }] })).toThrow(/scope/i);
   });
 
   it('keeps hostile untrusted text in bound values', () => {
     const store = open();
     const admitted = store.admit({ ...event, identity: { ...event.identity, baseRef: "main'; DROP TABLE attempts; --" } });
-    store.savePass(admitted.identity, { ...spec, id: "pass'); DROP TABLE pulls; --" }, {
+    save(store, admitted.identity, { ...spec, id: "pass'); DROP TABLE pulls; --" }, {
       ...outcome, passId: "pass'); DROP TABLE pulls; --",
     });
     expect(store.current('200', 42)?.passes).toHaveLength(1);

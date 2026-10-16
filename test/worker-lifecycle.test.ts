@@ -50,8 +50,9 @@ it('blocks admission after removal failure, then reaps before admitting again wi
       else if (args[0] === 'rm' && args.includes('a'.repeat(12))) remainingContainer = false;
       return { stdout, code: 0 };
     };
+    const credential = vi.fn(async () => 'synthetic-lifecycle-credential');
     const worker = await createWorker({ workerImage: `sha256:${'1'.repeat(64)}`, proxyImage: `sha256:${'2'.repeat(64)}`,
-      temporaryRoot: root, oauthToken: async () => 'synthetic-lifecycle-credential' });
+      temporaryRoot: root, oauthToken: credential });
     const identity = { ...event.identity, attemptId: '1', generation: 1, runtimeHash: worker.runtimeHash };
     const spec = passSpecSchema.parse({ id: 'lifecycle', kind: 'scope', unitIds: [], reviewUnits: [], sourceMap: [], trustedInstructions: [], priorFindings: [], bundlePath: bundle,
       contextHash: createHash('sha256').update(JSON.stringify({ policyHash: identity.policyHash, runtimeHash: worker.runtimeHash, files: [] })).digest('hex') });
@@ -63,6 +64,13 @@ it('blocks admission after removal failure, then reaps before admitting again wi
     await worker.reap();
     expect(remainingContainer).toBe(false);
     expect((await worker.runPass(identity, spec, new AbortController().signal)).status).toBe('completed');
+    expect(starts).toBe(2);
+    const beforeCredentialCount = credential.mock.calls.length;
+    const controller = new AbortController();
+    const guard = vi.fn(async () => { await Promise.resolve(); controller.abort(); controller.signal.throwIfAborted(); });
+    expect((await worker.runPass(identity, spec, controller.signal, guard)).failureCode).toBe('cancelled');
+    expect(guard).toHaveBeenCalledOnce();
+    expect(credential).toHaveBeenCalledTimes(beforeCredentialCount);
     expect(starts).toBe(2);
     for (const args of calls.filter(args => args[0] === 'create' || args[0] === 'run' && args.includes('-d'))) {
       expect(args[args.indexOf('--log-driver') + 1]).toBe('none');

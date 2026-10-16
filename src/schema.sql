@@ -23,10 +23,25 @@ CREATE TABLE attempts (
   updated_at INTEGER NOT NULL,
   lease_token TEXT,
   lease_expires_at INTEGER,
+  terminal_state TEXT CHECK (terminal_state IN ('complete', 'incomplete', 'intervention')),
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  recovery_started_at INTEGER,
+  last_work_at INTEGER NOT NULL DEFAULT 0,
+  intervention_reason TEXT,
+  result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  lease_losses INTEGER NOT NULL DEFAULT 0,
+  progress_sequence INTEGER NOT NULL DEFAULT 0,
   UNIQUE (repository_id, pull_number, generation),
   FOREIGN KEY (repository_id, pull_number) REFERENCES pulls(repository_id, pull_number),
   CHECK ((state = 'leased' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
     OR (state != 'leased' AND lease_token IS NULL AND lease_expires_at IS NULL))
+) STRICT;
+
+CREATE TABLE pass_executions (
+  attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+  pass_id TEXT NOT NULL,
+  count INTEGER NOT NULL CHECK (count > 0),
+  PRIMARY KEY (attempt_id, pass_id)
 ) STRICT;
 
 CREATE TABLE deliveries (
@@ -73,4 +88,4 @@ CREATE TABLE access_rules (
 CREATE TABLE access_clock (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL) STRICT;
 INSERT INTO access_clock VALUES (1, 0);
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;

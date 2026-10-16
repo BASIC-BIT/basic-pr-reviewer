@@ -212,13 +212,20 @@ export const publicationIntentSchema = z.strictObject({
 });
 export type PublicationIntent = z.infer<typeof publicationIntentSchema>;
 
-export const attemptStateSchema = z.enum(['queued', 'leased', 'superseded']);
+export const attemptStateSchema = z.enum(['queued', 'leased', 'superseded', 'complete', 'incomplete', 'intervention']);
 export type Lease = { token: string; expiresAt: number };
+export const leaseOwnershipSchema = z.strictObject({ token: z.string().uuid(), now: timestampSchema });
+export type LeaseOwnership = z.infer<typeof leaseOwnershipSchema>;
 export type AttemptRecord = {
   identity: ReviewIdentity;
   createdAt: number;
   updatedAt: number;
-} & ({ state: 'queued' | 'superseded'; lease: null } | { state: 'leased'; lease: Lease });
+  nextAttemptAt: number;
+  recoveryStartedAt: number | null;
+  lastWorkAt: number;
+  interventionReason: string | null;
+  result: ReviewResult | null;
+} & ({ state: 'queued' | 'superseded' | 'complete' | 'incomplete' | 'intervention'; lease: null } | { state: 'leased'; lease: Lease });
 export type Admission = AttemptRecord & { kind: 'created' | 'duplicate' };
 export type ClaimedAttempt = AttemptRecord & { state: 'leased'; lease: Lease };
 export type PassRecord = {
@@ -234,14 +241,19 @@ export type CoveragePlan = {
   freshPasses: PlannedPass[]; reusedPasses: PassRecord[];
   reusedPassIds: string[]; invalidatedPassIds: string[]; uncoveredUnitIds: string[];
 };
-export type ReviewResult = {
-  identity: ReviewIdentity; complete: boolean;
-  status: 'complete' | 'incomplete' | 'skipped'; reason: 'no_eligible_scope' | null;
-  coveredUnitIds: string[]; reusedUnitIds: string[]; missingUnitIds: string[];
-  integrationStatus: 'pending' | 'completed' | 'failed' | 'incomplete' | 'not_required';
-  findings: Finding[]; exclusions: z.infer<typeof sourceOmissionSchema>[];
-  missingScope: z.infer<typeof sourceOmissionSchema>[]; failureCodes: string[];
-  generation: number; publicationState: 'unpublished';
+export const reviewResultSchema = z.strictObject({
+  identity: reviewIdentitySchema, complete: z.boolean(),
+  status: z.enum(['complete', 'incomplete', 'skipped']), reason: z.literal('no_eligible_scope').nullable(),
+  coveredUnitIds: z.array(hashSchema), reusedUnitIds: z.array(hashSchema), missingUnitIds: z.array(hashSchema),
+  integrationStatus: z.enum(['pending', 'completed', 'failed', 'incomplete', 'not_required']),
+  findings: z.array(findingSchema), exclusions: z.array(sourceOmissionSchema),
+  missingScope: z.array(sourceOmissionSchema), failureCodes: z.array(idSchema),
+  generation: sequenceSchema, publicationState: z.literal('unpublished'),
+});
+export type ReviewResult = z.infer<typeof reviewResultSchema>;
+export type AttemptSettlement = {
+  state: 'queued' | 'complete' | 'incomplete' | 'intervention';
+  nextAttemptAt: number; reason: string | null; result: ReviewResult | null;
 };
 export type PullRecord = AttemptRecord & { rerunSequence: number; passes: PassRecord[] };
 export type PublicationRecord = {
@@ -255,7 +267,12 @@ export type PublicationRecord = {
 export interface Store {
   admit(event: AdmittedEvent): Admission;
   claim(now: number): ClaimedAttempt | null;
-  savePass(identity: ReviewIdentity, spec: PlannedPass | PassSpec, outcome: PassOutcome): void;
+  savePass(identity: ReviewIdentity, spec: PlannedPass | PassSpec, outcome: PassOutcome, owner: LeaseOwnership): void;
+  renewLease(identity: ReviewIdentity, owner: LeaseOwnership): Lease;
+  recoverExpiredLeases(now: number): void;
+  startPass(identity: ReviewIdentity, passId: string, owner: LeaseOwnership): number;
+  passAttempts(identity: ReviewIdentity, passId: string): number;
+  settle(identity: ReviewIdentity, owner: LeaseOwnership, settlement: AttemptSettlement): void;
   passHistory(repositoryId: string, pullNumber: number): PassRecord[];
   current(repositoryId: string, pullNumber: number): PullRecord | null;
   trackedPulls(installationId: string): { repositoryId: string; pullNumber: number }[];
@@ -269,7 +286,8 @@ export interface Store {
   setAccess(installationId: string, repositoryId: string | null, allowed: boolean): void;
   receipt(deliveryId: string): WebhookAdmission | null;
   acknowledge(deliveryId: string, admission: WebhookAdmission): void;
-  planPublication(intent: PublicationIntent): PublicationRecord;
+  planPublication(intent: PublicationIntent, owner: LeaseOwnership): PublicationRecord;
+  publications(repositoryId: string, pullNumber: number): PublicationRecord[];
   backup(path: string): Promise<void>;
   close(): void;
 }

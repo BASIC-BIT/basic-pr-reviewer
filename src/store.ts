@@ -5,14 +5,15 @@ import { z } from 'zod';
 import {
   admittedEventSchema, attemptStateSchema, passOutcomeSchema, passSpecSchema, plannedPassSchema, validatePassOutcome,
   publicationIntentSchema, reviewIdentitySchema, timestampSchema,
-  webhookAdmissionSchema,
+  webhookAdmissionSchema, leaseOwnershipSchema, reviewResultSchema,
 } from './contracts.js';
 import type {
   AttemptRecord, PassRecord, PublicationRecord, ReviewIdentity, Store,
-  PullObservation,
+  PullObservation, LeaseOwnership, AttemptSettlement,
 } from './contracts.js';
 
 export const LEASE_DURATION_MS = 60 * 60 * 1_000;
+export const RECOVERY_WINDOW_MS = 48 * 60 * 60 * 1_000;
 export class StaleAdmissionObservationError extends Error {
   constructor() {
     super('Stale admission observation; read current generation and live identity again');
@@ -23,6 +24,9 @@ const attemptRowSchema = z.object({
   identity_json: z.string(), state: attemptStateSchema,
   created_at: timestampSchema, updated_at: timestampSchema,
   lease_token: z.string().nullable(), lease_expires_at: timestampSchema.nullable(),
+  terminal_state: z.enum(['complete', 'incomplete', 'intervention']).nullable(),
+  next_attempt_at: timestampSchema, recovery_started_at: timestampSchema.nullable(),
+  last_work_at: timestampSchema, intervention_reason: z.string().nullable(), result_json: z.string().nullable(),
 });
 const passRowSchema = z.object({
   id: z.number().int().positive(), spec_json: z.string(), outcome_json: z.string(),
@@ -38,12 +42,15 @@ function readAttempt(value: unknown): AttemptRecord {
   const record = {
     identity: reviewIdentitySchema.parse(JSON.parse(row.identity_json)),
     createdAt: row.created_at, updatedAt: row.updated_at,
+    nextAttemptAt: row.next_attempt_at, recoveryStartedAt: row.recovery_started_at,
+    lastWorkAt: row.last_work_at, interventionReason: row.intervention_reason,
+    result: row.result_json === null ? null : reviewResultSchema.parse(JSON.parse(row.result_json)),
   };
   if (row.state === 'leased') {
     if (row.lease_token === null || row.lease_expires_at === null) throw new Error('Invalid stored lease');
     return { ...record, state: row.state, lease: { token: row.lease_token, expiresAt: row.lease_expires_at } };
   }
-  return { ...record, state: row.state, lease: null };
+  return { ...record, state: row.state === 'superseded' ? row.state : row.terminal_state ?? row.state, lease: null };
 }
 
 function readPass(value: unknown, identity: ReviewIdentity): PassRecord {
@@ -70,15 +77,30 @@ export function openStore(path: string): Store {
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     const { user_version: version } = z.object({ user_version: z.number().int() })
       .parse(db.prepare('PRAGMA user_version').get());
-    if (version !== 0 && version !== 2) throw new Error(`Unsupported schema version ${version}`);
+    if (![0, 2, 3].includes(version)) throw new Error(`Unsupported schema version ${version}`);
     db.exec('PRAGMA journal_mode = WAL');
     if (version === 0) {
       transaction(() => {
         const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
         if (current.user_version === 0) db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
-        else if (current.user_version !== 2) throw new Error(`Unsupported schema version ${current.user_version}`);
+        else if (current.user_version !== 3) throw new Error(`Unsupported schema version ${current.user_version}`);
       });
     }
+    if (version === 2) transaction(() => {
+      const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
+      if (current.user_version === 3) return;
+      db.exec(`ALTER TABLE attempts ADD COLUMN terminal_state TEXT CHECK (terminal_state IN ('complete', 'incomplete', 'intervention'));
+        ALTER TABLE attempts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE attempts ADD COLUMN recovery_started_at INTEGER;
+        ALTER TABLE attempts ADD COLUMN last_work_at INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE attempts ADD COLUMN intervention_reason TEXT;
+        ALTER TABLE attempts ADD COLUMN result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json));
+        ALTER TABLE attempts ADD COLUMN lease_losses INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE attempts ADD COLUMN progress_sequence INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE pass_executions (attempt_id INTEGER NOT NULL REFERENCES attempts(id), pass_id TEXT NOT NULL,
+          count INTEGER NOT NULL CHECK (count > 0), PRIMARY KEY (attempt_id, pass_id)) STRICT;
+        PRAGMA user_version = 3;`);
+    });
   } catch (error) {
     db.close();
     throw error;
@@ -103,11 +125,45 @@ export function openStore(path: string): Store {
   function assertCurrent(identity: ReviewIdentity): void {
     const stored = attempt(identity.attemptId);
     if (JSON.stringify(stored.identity) !== JSON.stringify(identity)) throw new Error('Review identity mismatch');
-    const current = db.prepare('SELECT current_attempt_id FROM pulls WHERE repository_id = ? AND pull_number = ?')
+    const current = db.prepare('SELECT current_attempt_id, generation FROM pulls WHERE repository_id = ? AND pull_number = ?')
       .get(identity.repositoryId, identity.pullNumber);
-    const pointer = z.object({ current_attempt_id: z.number().int().positive() }).parse(current);
-    if (String(pointer.current_attempt_id) !== identity.attemptId || stored.state === 'superseded') {
+    const pointer = z.object({ current_attempt_id: z.number().int().positive(), generation: timestampSchema }).parse(current);
+    if (String(pointer.current_attempt_id) !== identity.attemptId || pointer.generation !== identity.generation || stored.state === 'superseded') {
       throw new Error('Stale review generation');
+    }
+  }
+
+  function assertOwner(identity: ReviewIdentity, input: LeaseOwnership): LeaseOwnership {
+    assertCurrent(identity);
+    const owner = leaseOwnershipSchema.parse(input), record = attempt(identity.attemptId);
+    if (record.state !== 'leased' || record.lease.token !== owner.token || record.lease.expiresAt <= owner.now) throw new Error('Worker lease lost');
+    if (!accessAllowed(identity.installationId, identity.repositoryId)) throw new Error('Installation access revoked');
+    return owner;
+  }
+
+  function publication(input: PublicationRecord['intent'], now: number): PublicationRecord {
+    const intent = publicationIntentSchema.parse(input);
+    const existing = db.prepare('SELECT * FROM publications WHERE attempt_id = ? AND publication_key = ?')
+      .get(intent.identity.attemptId, intent.key);
+    if (existing) {
+      const record = readPublication(existing);
+      if (JSON.stringify(record.intent) !== JSON.stringify(intent)) throw new Error('Publication intent is immutable');
+      return record;
+    }
+    const inserted = db.prepare("INSERT INTO publications (attempt_id, publication_key, intent_json, state, created_at, updated_at) VALUES (?, ?, ?, 'planned', ?, ?)")
+      .run(intent.identity.attemptId, intent.key, JSON.stringify(intent), now, now);
+    return readPublication(db.prepare('SELECT * FROM publications WHERE id = ?').get(inserted.lastInsertRowid));
+  }
+
+  function progress(identity: ReviewIdentity, settlement: AttemptSettlement, now: number): void {
+    const body = JSON.stringify({ state: settlement.state, reason: settlement.reason, nextAttemptAt: settlement.nextAttemptAt, result: settlement.result });
+    const key = createHash('sha256').update(body).digest('hex');
+    db.prepare('UPDATE attempts SET progress_sequence = progress_sequence + 1 WHERE id = ?').run(identity.attemptId);
+    const { progress_sequence: sequence } = z.object({ progress_sequence: timestampSchema }).parse(db.prepare('SELECT progress_sequence FROM attempts WHERE id = ?').get(identity.attemptId));
+    db.prepare("UPDATE publications SET state = 'superseded', updated_at = ? WHERE attempt_id = ? AND state = 'planned' AND json_extract(intent_json, '$.channel') IN ('summary', 'check')")
+      .run(now, identity.attemptId);
+    for (const channel of ['summary', 'check'] satisfies PublicationRecord['intent']['channel'][]) {
+      publication({ identity, key: `${channel}-${sequence}-${key}`, channel, body }, now);
     }
   }
 
@@ -196,23 +252,75 @@ export function openStore(path: string): Store {
       timestampSchema.parse(now);
       const expiresAt = timestampSchema.parse(now + LEASE_DURATION_MS);
       return transaction(() => {
-        const candidate = db.prepare("SELECT a.* FROM attempts a JOIN pulls p ON p.current_attempt_id = a.id WHERE a.state = 'queued' OR (a.state = 'leased' AND a.lease_expires_at <= ?) ORDER BY a.created_at, a.id LIMIT 1").get(now);
+        if (db.prepare("SELECT 1 FROM attempts WHERE state = 'leased' LIMIT 1").get()) return null;
+        const candidate = db.prepare(`SELECT a.* FROM attempts a JOIN pulls p ON p.current_attempt_id = a.id
+          WHERE a.state = 'queued' AND a.terminal_state IS NULL AND a.next_attempt_at <= ? AND a.generation = p.generation
+          AND p.blocked_reason IS NULL ORDER BY a.last_work_at, a.created_at, a.id LIMIT 1`).get(now);
         if (!candidate) return null;
         const record = readAttempt(candidate);
         const lease = { token: randomUUID(), expiresAt };
-        db.prepare("UPDATE attempts SET state = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?")
-          .run(lease.token, expiresAt, now, record.identity.attemptId);
-        return { ...record, state: 'leased', updatedAt: now, lease };
+        db.prepare("UPDATE attempts SET state = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ?, recovery_started_at = COALESCE(recovery_started_at, ?) WHERE id = ?")
+          .run(lease.token, expiresAt, now, now, record.identity.attemptId);
+        return { ...record, recoveryStartedAt: record.recoveryStartedAt ?? now, state: 'leased', updatedAt: now, lease };
       });
     },
-    savePass(identityInput, specInput, outcomeInput) {
+    renewLease(identity, ownership) {
+      return transaction(() => {
+        const owner = assertOwner(identity, ownership), expiresAt = timestampSchema.parse(owner.now + LEASE_DURATION_MS);
+        db.prepare('UPDATE attempts SET lease_expires_at = ?, updated_at = ? WHERE id = ?').run(expiresAt, owner.now, identity.attemptId);
+        return { token: owner.token, expiresAt };
+      });
+    },
+    recoverExpiredLeases(now) {
+      timestampSchema.parse(now);
+      transaction(() => {
+        const rows = db.prepare("SELECT * FROM attempts WHERE state = 'leased' AND lease_expires_at <= ?").all(now);
+        for (const row of rows) {
+          const record = readAttempt(row), losses = z.object({ lease_losses: timestampSchema }).parse(row).lease_losses + 1;
+          const terminal = losses >= 4 || now - (record.recoveryStartedAt ?? now) >= RECOVERY_WINDOW_MS;
+          const reason = terminal ? 'lease_recovery_exhausted' : 'lease_expired';
+          db.prepare(`UPDATE attempts SET state = 'queued', terminal_state = ?, lease_token = NULL, lease_expires_at = NULL,
+            lease_losses = ?, next_attempt_at = ?, last_work_at = MAX(?, (SELECT MAX(last_work_at) + 1 FROM attempts)), intervention_reason = ?, updated_at = ? WHERE id = ?`)
+            .run(terminal ? 'incomplete' : null, losses, now, now, reason, now, record.identity.attemptId);
+          progress(record.identity, { state: terminal ? 'incomplete' : 'queued', reason, nextAttemptAt: now, result: record.result }, now);
+        }
+      });
+    },
+    startPass(identity, passId, ownership) {
+      return transaction(() => {
+        assertOwner(identity, ownership);
+        z.string().min(1).parse(passId);
+        db.prepare(`INSERT INTO pass_executions VALUES (?, ?, 1) ON CONFLICT(attempt_id, pass_id) DO UPDATE SET count = count + 1`).run(identity.attemptId, passId);
+        return z.object({ count: timestampSchema }).parse(db.prepare('SELECT count FROM pass_executions WHERE attempt_id = ? AND pass_id = ?').get(identity.attemptId, passId)).count;
+      });
+    },
+    passAttempts(identity, passId) {
+      const row = db.prepare('SELECT count FROM pass_executions WHERE attempt_id = ? AND pass_id = ?').get(identity.attemptId, passId);
+      return row ? z.object({ count: timestampSchema }).parse(row).count : 0;
+    },
+    settle(identity, ownership, input) {
+      const settlement = z.strictObject({ state: z.enum(['queued', 'complete', 'incomplete', 'intervention']),
+        nextAttemptAt: timestampSchema, reason: z.string().nullable(), result: reviewResultSchema.nullable() }).parse(input);
+      transaction(() => {
+        const owner = assertOwner(identity, ownership);
+        if (settlement.result && JSON.stringify(settlement.result.identity) !== JSON.stringify(identity)) throw new Error('Review identity mismatch');
+        if (settlement.state === 'complete' && (!settlement.result || !['complete', 'skipped'].includes(settlement.result.status))) throw new Error('Missing complete review result');
+        progress(identity, settlement, owner.now);
+        // Break equal-clock ties so one review cannot keep the oldest queue position.
+        db.prepare(`UPDATE attempts SET state = 'queued', terminal_state = ?, next_attempt_at = ?, last_work_at = MAX(?, (SELECT MAX(last_work_at) + 1 FROM attempts)), intervention_reason = ?,
+          result_json = ?, updated_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ?`)
+          .run(settlement.state === 'queued' ? null : settlement.state, settlement.nextAttemptAt, owner.now, settlement.reason,
+            settlement.result ? JSON.stringify(settlement.result) : null, owner.now, identity.attemptId);
+      });
+    },
+    savePass(identityInput, specInput, outcomeInput, ownership) {
       const identity = reviewIdentitySchema.parse(identityInput);
       const { bundlePath: _path, reviewUnits: _units, sourceMap: _map, trustedInstructions: _instructions, ...planned } = 'bundlePath' in specInput
         ? passSpecSchema.parse(specInput) : { ...plannedPassSchema.parse(specInput), bundlePath: null, reviewUnits: [], sourceMap: [], trustedInstructions: [] };
       const spec = plannedPassSchema.parse(planned);
       const outcome = validatePassOutcome(spec, outcomeInput);
       transaction(() => {
-        assertCurrent(identity);
+        const owner = assertOwner(identity, ownership);
         const specJson = JSON.stringify(spec);
         const outcomeJson = JSON.stringify(outcome);
         const existing = db.prepare('SELECT * FROM passes WHERE attempt_id = ? AND pass_id = ?').get(identity.attemptId, spec.id);
@@ -222,7 +330,7 @@ export function openStore(path: string): Store {
           if (JSON.stringify(saved.outcome) === outcomeJson) return;
           if (saved.outcome.status === 'completed') throw new Error('Completed pass is immutable');
         }
-        const now = Date.now();
+        const now = owner.now;
         db.prepare('INSERT INTO passes (attempt_id, pass_id, spec_json, outcome_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id, pass_id) DO UPDATE SET outcome_json = excluded.outcome_json, updated_at = excluded.updated_at')
           .run(identity.attemptId, spec.id, specJson, outcomeJson, now, now);
       });
@@ -289,22 +397,16 @@ export function openStore(path: string): Store {
       const admission = webhookAdmissionSchema.parse(input);
       db.prepare('INSERT INTO webhook_receipts VALUES (?, ?, ?) ON CONFLICT DO NOTHING').run(deliveryId, JSON.stringify(admission), Date.now());
     },
-    planPublication(input) {
+    planPublication(input, ownership) {
       const intent = publicationIntentSchema.parse(input);
       return transaction(() => {
-        assertCurrent(intent.identity);
-        const existing = db.prepare('SELECT * FROM publications WHERE attempt_id = ? AND publication_key = ?')
-          .get(intent.identity.attemptId, intent.key);
-        if (existing) {
-          const record = readPublication(existing);
-          if (JSON.stringify(record.intent) !== JSON.stringify(intent)) throw new Error('Publication intent is immutable');
-          return record;
-        }
-        const now = Date.now();
-        const inserted = db.prepare("INSERT INTO publications (attempt_id, publication_key, intent_json, state, created_at, updated_at) VALUES (?, ?, ?, 'planned', ?, ?)")
-          .run(intent.identity.attemptId, intent.key, JSON.stringify(intent), now, now);
-        return readPublication(db.prepare('SELECT * FROM publications WHERE id = ?').get(inserted.lastInsertRowid));
+        const owner = assertOwner(intent.identity, ownership);
+        return publication(intent, owner.now);
       });
+    },
+    publications(repositoryId, pullNumber) {
+      return db.prepare(`SELECT p.* FROM publications p JOIN attempts a ON a.id = p.attempt_id
+        WHERE a.repository_id = ? AND a.pull_number = ? ORDER BY p.id`).all(repositoryId, pullNumber).map(readPublication);
     },
     async backup(destination) {
       await backup(db, destination);

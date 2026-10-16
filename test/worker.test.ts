@@ -15,6 +15,22 @@ describe('worker output boundary', () => {
   it('accepts only a successful structured result with the pinned model', () => {
     expect(validateOutcome(terminal(), spec)).toMatchObject({ status: 'completed', findings: [], model: { name: profile.model } });
   });
+  it('classifies observed CLI authentication and quota metadata on nonzero exits without accepting findings', () => {
+    for (const [status, code] of [[401, 'authentication_failure'], [429, 'quota_limited']] as const) {
+      const raw = terminal({ is_error: true, terminal_reason: 'api_error', api_error_status: status, result: 'SECRET_RAW_ERROR' });
+      const result = validateOutcome(raw, spec, 1);
+      expect(result).toMatchObject({ status: 'failed', failureCode: code, findings: [] });
+      expect(JSON.stringify(result)).not.toContain('SECRET_RAW_ERROR');
+    }
+    expect(validateOutcome(terminal(), spec, 1).status).toBe('failed');
+    expect(validateOutcome(terminal({ structured_output: { findings: [], priorFindingAssessments: [], api_error_status: 401 } }), spec).failureCode).toBe('invalid_output');
+  });
+  it('keeps independently validated structured findings on exhaustion without certifying coverage', () => {
+    const { id: _id, ...finding } = saved.findings[0]!;
+    const raw = terminal({ subtype: 'error_max_turns', is_error: true, structured_output: { findings: [finding], priorFindingAssessments: [] } });
+    expect(validateOutcome(raw, spec, 1)).toMatchObject({ status: 'incomplete', failureCode: 'turn_limit', findings: [expect.objectContaining({ message: finding.message })] });
+    expect(validateOutcome(terminal({ subtype: 'error_max_turns', modelUsage: {} }), spec, 1).findings).toEqual([]);
+  });
   it('assigns stable service IDs and verifies finding paths, lines and evidence', () => {
     const original = saved.findings[0];
     if (!original) throw new Error('missing fixture');
@@ -70,6 +86,10 @@ describe('bounded fake CLI execution', () => {
   });
   it('times out a hanging process', async () => {
     expect(await execute('setInterval(()=>{},1000)', undefined, 50)).toEqual({ kind: 'failed', code: 'timeout' });
+  });
+  it.skipIf(process.platform === 'win32')('kills the timed-out process group including children holding its output pipe', async () => {
+    expect(await execute("require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});setInterval(()=>{},1000)", undefined, 250))
+      .toEqual({ kind: 'failed', code: 'timeout' });
   });
   it('honors cancellation', async () => {
     const controller = new AbortController();

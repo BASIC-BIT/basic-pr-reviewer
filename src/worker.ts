@@ -12,6 +12,7 @@ export const profile = Object.freeze({ cliVersion: '2.1.301', model: 'claude-opu
   squid: '5.7-2+deb12u6',
   platform: 'linux/amd64', baseDigest: 'sha256:ec857ea6bb60cb3d0fa4d97495590c5fe7d51be8572c307b55957eeb06569cf7',
   maxTurns: 100, timeoutMs: 60 * 60 * 1000, maxOutputBytes: 2 * 1024 * 1024 });
+class WorkerError extends Error { constructor(readonly code: string) { super(code); } }
 
 export const workerOutputSchema = z.strictObject({
   findings: z.array(findingSchema.omit({ id: true })),
@@ -109,7 +110,7 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
     const bytes = await control(['run', '--rm', '--pull', 'never', '--network', 'none', '--entrypoint', 'cat', image, destination]);
     if (bytes !== readFileSync(new URL(`../worker/${source}`, import.meta.url), 'utf8').trim()) throw new Error('profile_mismatch');
   }
-  async function runPass(input: ReviewIdentity, assigned: PassSpec, signal: AbortSignal): Promise<PassOutcome> {
+  async function runPass(input: ReviewIdentity, assigned: PassSpec, signal: AbortSignal, beforeCredential?: () => Promise<void>): Promise<PassOutcome> {
     const identity = reviewIdentitySchema.parse(input), spec = passSpecSchema.parse(assigned);
     if (identity.runtimeHash !== runtimeHash) return failedOutcome(spec, 'runtime_mismatch');
     if (spec.contextHash !== createHash('sha256').update(JSON.stringify({ policyHash: identity.policyHash, runtimeHash, files: spec.sourceMap })).digest('hex')) return failedOutcome(spec, 'context_mismatch');
@@ -119,29 +120,40 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
     active = true;
     const name = `reviewer-${randomUUID()}`, internal = `${name}-internal`, egress = `${name}-egress`, proxy = `${name}-proxy`;
     const networks: string[] = [], containers: string[] = [];
+    async function setup(args: string[]): Promise<string> {
+      signal.throwIfAborted();
+      const value = await control(args);
+      signal.throwIfAborted();
+      return value;
+    }
     let temporary: string | undefined;
     let outcome: PassOutcome = failedOutcome(spec, 'worker_failure');
     try {
       temporary = await mkdtemp(join(root, 'worker-'));
+      signal.throwIfAborted();
       const prompt = await passPrompt(spec);
       signal.throwIfAborted();
       networks.push(internal);
-      await control(['network', 'create', '--label', ownerLabel, '--internal', '--opt', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', internal]);
-      networks.push(egress); await control(['network', 'create', '--label', ownerLabel, egress]);
+      await setup(['network', 'create', '--label', ownerLabel, '--internal', '--opt', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', internal]);
+      networks.push(egress); await setup(['network', 'create', '--label', ownerLabel, egress]);
       containers.push(proxy);
-      await control(['run', '-d', '--pull', 'never', '--log-driver', 'none', '--label', ownerLabel, '--name', proxy, '--network', egress,
+      await setup(['run', '-d', '--pull', 'never', '--log-driver', 'none', '--label', ownerLabel, '--name', proxy, '--network', egress,
         ...sandboxArguments(), '--workdir', '/tmp', proxyImage]);
-      await control(['network', 'connect', '--alias', 'egress', internal, proxy]);
+      await setup(['network', 'connect', '--alias', 'egress', internal, proxy]);
       let certificate = '';
       for (let tries = 0; tries < 30 && !certificate; tries++) {
         signal.throwIfAborted();
-        certificate = await control(['exec', proxy, 'node', '-e', "const fs=require('fs'),net=require('net');const s=net.connect(3128,'127.0.0.1',()=>{s.destroy();process.stdout.write(fs.readFileSync('/tmp/ca.pem'))});s.on('error',()=>{})"]);
+        certificate = await setup(['exec', proxy, 'node', '-e', "const fs=require('fs'),net=require('net');const s=net.connect(3128,'127.0.0.1',()=>{s.destroy();process.stdout.write(fs.readFileSync('/tmp/ca.pem'))});s.on('error',()=>{})"]);
         if (!certificate) await delay(100, undefined, { signal });
       }
       if (!certificate.startsWith('-----BEGIN CERTIFICATE-----')) throw new Error('proxy_unavailable');
       const caPath = join(temporary, 'ca.pem'); await writeFile(caPath, certificate, { mode: 0o444, flag: 'wx' });
-      const token = await options.oauthToken();
-      if (!/^[\x21-\x7e]{1,8192}$/.test(token)) throw new Error('credential_unavailable');
+      await beforeCredential?.();
+      signal.throwIfAborted();
+      let token: string;
+      try { token = await options.oauthToken(); } catch { throw new WorkerError('credential_unavailable'); }
+      await beforeCredential?.();
+      if (!/^[\x21-\x7e]{1,8192}$/.test(token)) throw new WorkerError('credential_unavailable');
       signal.throwIfAborted();
       containers.push(name);
       const created = await runBounded('docker', ['create', '--pull', 'never', '--log-driver', 'none', '--label', ownerLabel, '--name', name, '-i', '--network', internal,
@@ -150,18 +162,20 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
         '--mount', `type=bind,source=${spec.bundlePath},target=/bundle,readonly`, workerImage, ...cliArguments()],
       { signal: controlSignal, timeoutMs: 30000, env: hostEnv });
       if (created.kind !== 'exited') throw new Error('worker_create_failure');
-      const result = await runBounded('docker', ['start', '--attach', '--interactive', name], { signal, timeoutMs: profile.timeoutMs, env: hostEnv, input: `${token}\n${prompt}` });
+      await beforeCredential?.();
+      signal.throwIfAborted();
+      const result = await runBounded('docker', ['start', '--attach', '--interactive', name], { signal, timeoutMs: profile.timeoutMs, env: hostEnv, input: `${token}\n${prompt}`, captureErrorEnvelope: true });
       outcome = result.kind === 'failed' ? failedOutcome(spec, result.code)
-        : result.stdout.includes(token) ? failedOutcome(spec, 'credential_in_output') : validateOutcome(result.stdout, spec);
-    } catch { outcome = failedOutcome(spec, signal.aborted ? 'cancelled' : 'worker_failure'); }
+        : result.stdout.includes(token) ? failedOutcome(spec, 'credential_in_output') : validateOutcome(result.stdout, spec, result.exitCode ?? 0);
+    } catch (error) { outcome = failedOutcome(spec, signal.aborted ? 'cancelled' : error instanceof WorkerError ? error.code : 'worker_failure'); }
     finally {
       for (const container of containers.reverse()) {
-        try { await control(['rm', '-f', container]); } catch { outcome = failedOutcome(spec, 'cleanup_failure'); }
+        try { await control(['rm', '-f', container]); } catch { outcome = { ...outcome, status: 'failed', failureCode: 'cleanup_failure' }; }
       }
       for (const network of networks.reverse()) {
-        try { await control(['network', 'rm', network]); } catch { outcome = failedOutcome(spec, 'cleanup_failure'); }
+        try { await control(['network', 'rm', network]); } catch { outcome = { ...outcome, status: 'failed', failureCode: 'cleanup_failure' }; }
       }
-      try { if (temporary) await rm(temporary, { recursive: true, force: true }); } catch { outcome = failedOutcome(spec, 'cleanup_failure'); }
+      try { if (temporary) await rm(temporary, { recursive: true, force: true }); } catch { outcome = { ...outcome, status: 'failed', failureCode: 'cleanup_failure' }; }
       if (outcome.failureCode === 'cleanup_failure') recovered = false;
       active = false;
     }
@@ -194,6 +208,7 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
 }
 const tokens = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const envelopeSchema = z.object({ type: z.literal('result'), subtype: z.string(), is_error: z.boolean(),
+  terminal_reason: z.string().optional(), api_error_status: z.number().int().min(400).max(599).optional(),
   structured_output: z.unknown().optional(), modelUsage: z.record(z.string(), z.object({ inputTokens: tokens, outputTokens: tokens })).optional() });
 
 export function failedOutcome(spec: PassSpec, code: string): PassOutcome {
@@ -202,16 +217,22 @@ export function failedOutcome(spec: PassSpec, code: string): PassOutcome {
     usage: { inputTokens: null, outputTokens: null } };
 }
 
-// The caller must first prove exit zero and the pinned executable identity.
-export function validateOutcome(raw: Buffer, input: PassSpec): PassOutcome {
+// The caller proves the pinned executable and supplies its exit code; only zero exits may complete.
+export function validateOutcome(raw: Buffer, input: PassSpec, exitCode = 0): PassOutcome {
   if (raw.length > profile.maxOutputBytes) return failedOutcome(input, 'output_limit');
   try {
     const spec = passSpecSchema.parse(input);
     const envelope = envelopeSchema.parse(JSON.parse(raw.toString('utf8')));
-    if (envelope.subtype === 'error_max_turns') return failedOutcome(spec, 'turn_limit');
-    if (envelope.is_error || envelope.subtype !== 'success') return failedOutcome(spec, 'provider_failure');
+    if (envelope.is_error && envelope.terminal_reason === 'api_error') {
+      if (envelope.api_error_status === 401) return failedOutcome(spec, 'authentication_failure');
+      if (envelope.api_error_status === 403) return failedOutcome(spec, 'provider_access_denied');
+      if (envelope.api_error_status === 429) return failedOutcome(spec, 'quota_limited');
+    }
+    const exhausted = envelope.subtype === 'error_max_turns';
+    if (!exhausted && (envelope.is_error || envelope.subtype !== 'success' || exitCode !== 0)) return failedOutcome(spec, 'provider_failure');
     const usage = envelope.modelUsage?.[profile.model];
-    if (!usage || Object.keys(envelope.modelUsage ?? {}).some((name) => name !== profile.model)) return failedOutcome(spec, 'model_mismatch');
+    if (!usage || Object.keys(envelope.modelUsage ?? {}).some((name) => name !== profile.model)) return failedOutcome(spec, exhausted ? 'turn_limit' : 'model_mismatch');
+    if (exhausted && envelope.structured_output === undefined) return failedOutcome(spec, 'turn_limit');
     const output = workerOutputSchema.parse(envelope.structured_output);
     for (const finding of output.findings) {
       const location = finding.location;
@@ -225,7 +246,7 @@ export function validateOutcome(raw: Buffer, input: PassSpec): PassOutcome {
           location.startLine >= lines.start && location.endLine < lines.start + lines.count;
       })) throw new Error('location');
     }
-    return validatePassOutcome(spec, { passId: spec.id, status: 'completed', failureCode: null,
+    return validatePassOutcome(spec, { passId: spec.id, ...(exhausted ? { status: 'incomplete', failureCode: 'turn_limit' } as const : { status: 'completed', failureCode: null } as const),
       findings: output.findings.map((finding, index) => ({ ...finding,
         id: createHash('sha256').update(JSON.stringify([spec.id, index, finding])).digest('hex') })),
       priorFindingAssessments: output.priorFindingAssessments,
@@ -233,16 +254,21 @@ export function validateOutcome(raw: Buffer, input: PassSpec): PassOutcome {
   } catch { return failedOutcome(input, 'invalid_output'); }
 }
 
-type ProcessResult = { kind: 'exited'; stdout: Buffer } | { kind: 'failed'; code: string };
+type ProcessResult = { kind: 'exited'; stdout: Buffer; exitCode?: number } | { kind: 'failed'; code: string };
 export function runBounded(command: string, args: string[], options: {
-  signal: AbortSignal; timeoutMs: number; env: NodeJS.ProcessEnv; input?: string;
+  signal: AbortSignal; timeoutMs: number; env: NodeJS.ProcessEnv; input?: string; captureErrorEnvelope?: boolean;
 }): Promise<ProcessResult> {
   if (options.signal.aborted) return Promise.resolve({ kind: 'failed', code: 'cancelled' });
   return new Promise((resolve) => {
-    const child = spawn(command, args, { env: options.env, shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env: options.env, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks: Buffer[] = [];
     let size = 0, failure: string | undefined;
-    const stop = (code: string) => { failure ??= code; child.kill('SIGKILL'); };
+    const stop = (code: string) => {
+      failure ??= code;
+      if (child.pid && process.platform !== 'win32') {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+      } else child.kill('SIGKILL');
+    };
     const timer = setTimeout(() => stop('timeout'), options.timeoutMs);
     const abort = () => stop('cancelled');
     options.signal.addEventListener('abort', abort, { once: true });
@@ -257,7 +283,8 @@ export function runBounded(command: string, args: string[], options: {
     child.stdin.on('error', () => { /* Early provider exits can close stdin before the prompt is written. */ });
     child.on('close', (code) => {
       clearTimeout(timer); options.signal.removeEventListener('abort', abort);
-      resolve(failure || code !== 0 ? { kind: 'failed', code: failure ?? 'process_failure' } : { kind: 'exited', stdout: Buffer.concat(chunks) });
+      resolve(failure || code !== 0 && !options.captureErrorEnvelope ? { kind: 'failed', code: failure ?? 'process_failure' }
+        : { kind: 'exited', stdout: Buffer.concat(chunks), ...(code !== 0 ? { exitCode: code ?? 1 } : {}) });
     });
     child.stdin.end(options.input ?? '');
   });

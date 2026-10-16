@@ -123,7 +123,7 @@ describe('signed, durable event admission', () => {
     expect(store.current('200', 42)?.state).toBe('superseded');
     expect(store.observation('200', 42).generation).toBeGreaterThan(previous.identity.generation);
     expect(store.claim(Date.now())).toBeNull();
-    expect(() => store.planPublication({ identity: previous.identity, key: 'stale', channel: 'summary', body: 'old' })).toThrow(/stale/i);
+    expect(() => store.planPublication({ identity: previous.identity, key: 'stale', channel: 'summary', body: 'old' }, { token: previous.lease.token, now: Date.now() })).toThrow(/stale/i);
   });
   it('compares repository identities, admitting internal PRs in forked repositories', async () => {
     const { store, github, service } = setup();

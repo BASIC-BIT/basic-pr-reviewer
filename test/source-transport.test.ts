@@ -48,6 +48,17 @@ async function checkTransport(exerciseHelper: boolean, host = 'github.com') {
   return credentialOutput;
 }
 it('constructs an HTTPS-only exact-SHA fetch with process-scoped credentials and sanitized failure', async () => { await checkTransport(false); });
+it('checks the claimed identity after asynchronous setup and before resolving a Git credential', async () => {
+  const root = await mkdtemp(join(process.cwd(), 'reviewer-test-source-guard-')); roots.push(root);
+  const credential = vi.fn(async () => 'synthetic-secret-token');
+  const source = await createSourceService({ root, credential });
+  const controller = new AbortController();
+  await expect(source.captureManifest(identity, trusted, controller.signal, async () => {
+    await Promise.resolve(); controller.abort(); controller.signal.throwIfAborted();
+  })).rejects.toThrow('cancelled');
+  expect(credential).not.toHaveBeenCalled();
+  expect(await readdir(root)).toEqual([]);
+});
 it.skipIf(process.env.REVIEWER_HOST_GIT_TEST !== '1')('launches the real Git credential helper with only synthetic credentials and rejects another host', async () => {
   expect(await checkTransport(true)).toContain('password=synthetic-secret-token');
   expect(await checkTransport(true, 'untrusted.invalid')).not.toContain('synthetic-secret-token');
