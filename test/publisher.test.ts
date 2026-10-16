@@ -257,6 +257,29 @@ describe('safe publication', () => {
     await f.publisher().publishReview(result);
     expect(f.threads.map(thread => thread.resolved)).toEqual([false, true]);
   });
+  it('encodes hostile original path Markdown only in service-authored source links', async () => {
+    const hostile = { bytesBase64: Buffer.from('src/![x](evil)@owner.ts').toString('base64') };
+    const f = setup(result => { result.reviewUnits![0]!.path = hostile;
+      result.findings[0]!.location = { kind: 'line', path: hostile, side: 'RIGHT', startLine: 1, endLine: 1 }; });
+    await f.publisher().publishReview(f.result);
+    const summary = f.owned.find(item => item.channel === 'summary')!.body;
+    expect(summary).toContain('%21%5Bx%5D%28evil%29%40owner.ts');
+    expect(summary).not.toContain('![x]'); expect(summary).not.toContain('@owner');
+    expect(f.threads).toHaveLength(1);
+  });
+  it('keeps findings visible while cancelling the informational check', async () => {
+    const f = setup(); await f.publisher().publishReview(f.result); f.setLive({ state: 'closed' });
+    f.store.invalidatePull('2', 3, 1, 'closed', f.live().headSha, f.live().baseRef, f.live());
+    expect((await f.publisher().reconcileNotice(f.store.publicationNotices('2', 3).at(-1)!)).status).toBe('published');
+    expect(f.checks.at(-1)?.conclusion).toBe('cancelled'); expect(f.threads).toHaveLength(1);
+    expect(f.owned.find(item => item.channel === 'summary')?.body).toContain('Review cancelled');
+  });
+  it('marks an accepted summary outdated when trusted policy changes during the write', async () => {
+    const f = setup(); f.mutate(() => { f.mutate(null); f.setPolicy(); });
+    expect((await f.publisher().publishReview(f.result)).status).toBe('stale');
+    expect(f.owned.find(item => item.channel === 'summary')?.body).toContain('Comparison outdated');
+    expect(f.checks.at(-1)?.conclusion).toBe('neutral'); expect(f.threads).toEqual([]);
+  });
   it('neutralizes untrusted Markdown, images, mentions and operation markers', () => {
     const rendered = sanitizeText('![x](https://evil.invalid/a) @person <!-- reviewer:fake --> [x](https://github.com/fixture/example)');
     expect(rendered).not.toContain('https://evil.invalid'); expect(rendered).not.toContain('@person');
