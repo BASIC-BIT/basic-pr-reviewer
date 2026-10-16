@@ -54,7 +54,7 @@ function setup(change: (result: ReviewResult) => void = () => {}, database = ':m
     async resolveThread(_target, id) { threads.find((item) => item.id === id)!.resolved = true; mutate?.(); },
     async unresolveThread(_target, id) { threads.find((item) => item.id === id)!.resolved = false; },
   };
-  const publisher = () => createPublisher({ store, github, readPolicy: async () => ({ policy: repoPolicySchema.parse({ schemaVersion: 1, enabled: true }), policyHash }),
+  const publisher = (readPolicy = async () => ({ policy: repoPolicySchema.parse({ schemaVersion: 1, enabled: true }), policyHash })) => createPublisher({ store, github, readPolicy,
     notify: notice => { notices.push(notice.reason); }, engineRevision: 'fixture-engine', operatorCommand: 'reviewer inspect' });
   return { store, identity, result, owned, threads, publisher, github, notices, checks, live: () => live, setPolicy: () => { policyHash = 'f'.repeat(64); }, setLive: (value: Partial<LivePull>) => { live = { ...live, ...value }; },
     loseReview: () => { loseReview = true; }, mutate: (value: (() => void) | null) => { mutate = value; }, calls: () => calls };
@@ -180,6 +180,56 @@ describe('safe publication', () => {
     expect((await f.publisher().publishReview(result)).status).toBe('pending');
     expect((await f.publisher().publishReview(result)).status).toBe('published'); expect(f.threads[0]!.resolved).toBe(false);
     expect(f.store.publicationOperations('2', 3).filter(item => item.channel === 'unresolve')).toMatchObject([{ state: 'acknowledged' }]);
+  });
+  async function lostResolution() {
+    const f = setup(); await f.publisher().publishReview(f.result);
+    const next = f.store.admit({ schemaVersion: 1, deliveryId: 'rerun', receivedAt: 3, expectedGeneration: 1, identity: input, trigger: { kind: 'rerun', sequence: 1 } });
+    const result = { ...f.result, identity: next.identity, generation: 2, findings: [], priorFindingAssessments: [{ findingId: 'finding-one', assessment: 'fixed' as const }] };
+    const claim = f.store.claim(4)!; f.store.settle(next.identity, { token: claim.lease.token, now: 5 }, { state: 'complete', result, reason: null, nextAttemptAt: 5 });
+    let resolves = 0;
+    f.github.resolveThread = async () => { resolves++; f.threads[0]!.resolved = true; throw new Error('resolve ack lost'); };
+    expect((await f.publisher().publishReview(result)).status).toBe('pending');
+    const operation = f.store.publicationOperations('2', 3).find(item => item.channel === 'resolve')!;
+    if (operation.fence.kind !== 'review') throw new Error('Expected review fence');
+    const publicationId = operation.fence.publicationId;
+    const record = f.store.publications('2', 3).find(item => item.id === publicationId)!;
+    expect(operation.state).toBe('sending');
+    return { ...f, record, operation, resolves: () => resolves };
+  }
+  it.each(['headSha', 'baseSha', 'baseRef', 'mergeBaseSha', 'policy'] as const)('undoes a recovered resolution when live %s changed before admission', async field => {
+    const f = await lostResolution();
+    const observation = f.store.observation('2', 3);
+    if (field === 'policy') f.setPolicy();
+    else f.setLive({ [field]: field === 'baseRef' ? 'release' : '9'.repeat(40) });
+    expect(f.store.observation('2', 3)).toEqual(observation);
+    expect(f.store.publicationFenceCurrent(f.operation.fence)).toBe(true);
+    f.threads.push({ ...f.threads[0]!, id: 'unrelated-resolved-thread' });
+    expect((await f.publisher().reconcilePublication(f.record)).status).toBe('stale');
+    expect(f.threads[0]!.resolved).toBe(false);
+    expect(f.threads[1]!.resolved).toBe(true);
+    expect(f.resolves()).toBe(1);
+    expect(f.store.publicationOperations('2', 3).filter(item => item.channel === 'unresolve')).toMatchObject([
+      { fence: f.operation.fence, target: f.operation.target, body: f.operation.body, state: 'acknowledged' },
+    ]);
+    expect(f.store.publicationOperations('2', 3).find(item => item.key === f.operation.key)?.state).toBe('acknowledged');
+  });
+  it.each(['pull', 'policy', 'thread'] as const)('keeps lost resolution recovery pending when %s evidence is unavailable', async unavailable => {
+    const f = await lostResolution();
+    const fail = async (): Promise<never> => { throw new Error('evidence unavailable'); };
+    if (unavailable === 'pull') f.github.readLivePull = fail;
+    if (unavailable === 'thread') f.github.listThreads = fail;
+    const publisher = unavailable === 'policy' ? f.publisher(fail) : f.publisher();
+    expect((await publisher.reconcilePublication(f.record)).status).toBe('pending');
+    expect(f.store.publicationOperations('2', 3).find(item => item.key === f.operation.key)?.state).toBe('sending');
+    expect(f.store.publicationOperations('2', 3).filter(item => item.channel === 'unresolve')).toEqual([]);
+    expect(f.threads[0]!.resolved).toBe(true); expect(f.resolves()).toBe(1);
+  });
+  it('acknowledges a recovered resolution only while its original live comparison and policy remain current', async () => {
+    const f = await lostResolution();
+    expect((await f.publisher().reconcilePublication(f.record)).status).toBe('published');
+    expect(f.store.publicationOperations('2', 3).find(item => item.key === f.operation.key)?.state).toBe('acknowledged');
+    expect(f.store.publicationOperations('2', 3).filter(item => item.channel === 'unresolve')).toEqual([]);
+    expect(f.threads[0]!.resolved).toBe(true); expect(f.resolves()).toBe(1);
   });
   it('closes a previously published finding through real source, planner, integration and SQLite settlement', async () => {
     const repo = await fixture([], [{ path: 'src/index.ts', text: 'broken\n' }]), trusted = policy(), { source } = await service(repo);

@@ -199,10 +199,22 @@ export function createPublisher(options: {
   async function recoverResolutions(target: PublicationTarget): Promise<void> {
     const operations = store.publicationOperations(target.repositoryId, target.pullNumber);
     for (const operation of operations.filter(item => item.channel === 'resolve' && item.state === 'sending')) {
-      const thread = (await github.listThreads(target)).find(thread => thread.id === operation.body);
+      if (operation.fence.kind !== 'review') throw new PendingPublication();
+      const publicationId = operation.fence.publicationId;
+      const original = store.publications(target.repositoryId, target.pullNumber).find(item => item.id === publicationId);
+      if (!original || !same(destination(original.intent.identity), operation.target)) throw new PendingPublication();
+      const thread = (await github.listThreads(operation.target)).find(thread => thread.id === operation.body);
       if (!thread?.owned) throw new PendingPublication();
-      if (thread.hasReplies || !store.publicationFenceCurrent(operation.fence)) await undoResolution(operation);
-      else if (thread.resolved) store.acknowledgePublication(operation.key, thread.id);
+      if (thread.hasReplies) { await undoResolution(operation); continue; }
+      try {
+        // A lost response still needs the original write's live comparison and policy fence.
+        await guard(operation.target, operation.fence, original.intent.identity);
+      } catch (error) {
+        if (!(error instanceof StalePublication)) throw error;
+        await undoResolution(operation);
+        continue;
+      }
+      if (thread.resolved) store.acknowledgePublication(operation.key, thread.id);
       // An unresolved thread may be retried only by current complete assessment cleanup.
     }
     for (const operation of operations.filter(item => item.channel === 'unresolve' && item.state === 'sending')) {
