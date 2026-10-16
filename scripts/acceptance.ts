@@ -22,6 +22,7 @@ function docker(args: string[], input?: string) {
   return (args[0] === 'logs' ? result.stdout + result.stderr : result.stdout).trim();
 }
 const hardened = sandboxArguments();
+let failed = false;
 try {
   const workerId = docker(['image', 'inspect', worker, '--format', '{{.Id}}']);
   const proxyId = docker(['image', 'inspect', proxy, '--format', '{{.Id}}']);
@@ -38,8 +39,8 @@ try {
     '--mount', `type=volume,source=${volume},target=/bundle,volume-subpath=${materialized.subpath},readonly`, '--entrypoint', 'node', workerId, '-e',
     `const fs=require('fs'),assert=require('assert/strict'); assert.equal(process.getuid(),1000);
       for(const alias of ${JSON.stringify(materialized.aliases)}){const path='/bundle/'+alias;assert.ok(fs.readFileSync(path).length);assert.equal(fs.statSync(path).mode&511,256);assert.throws(()=>fs.writeFileSync(path,'forbidden'));}`]);
-  assert.equal(docker(['run', '--rm', '--network', 'none', ...hardened, workerId, '--version']), `${profile.cliVersion} (Claude Code)`);
-  const help = docker(['run', '--rm', '--network', 'none', ...hardened, workerId, '--help']);
+  assert.equal(docker(['run', '--rm', '--network', 'none', ...hardened, '--entrypoint', 'claude', workerId, '--version']), `${profile.cliVersion} (Claude Code)`);
+  const help = docker(['run', '--rm', '--network', 'none', ...hardened, '--entrypoint', 'claude', workerId, '--help']);
   for (const flag of ['--restricted', '--safe-mode', '--tools', '--strict-mcp-config', '--json-schema']) assert.ok(help.includes(flag));
   docker(['network', 'create', '--internal', '--opt', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', network]); networks.push(network);
   docker(['network', 'create', egress]); networks.push(egress);
@@ -126,16 +127,21 @@ try {
   }
   const fakeWorker = `${prefix}-worker`; containers.push(fakeWorker);
   let raw: string;
-  try { raw = docker(['run', '--name', fakeWorker, '-i', '--network', network, ...hardened,
+  try { raw = docker(['run', '--name', fakeWorker, '--log-driver', 'none', '-i', '--network', network, ...hardened,
     '--env', 'HTTPS_PROXY=http://fake-egress:3128', '--env', 'HTTP_PROXY=http://fake-egress:3128',
-    '--env', 'NODE_EXTRA_CA_CERTS=/trust/ca.pem', '--env', 'CLAUDE_CODE_OAUTH_TOKEN=synthetic-oauth-token',
+    '--env', 'NODE_EXTRA_CA_CERTS=/trust/ca.pem',
     '--mount', `type=bind,source=${join(temporary, 'ca.pem')},target=/trust/ca.pem,readonly`,
     '--mount', `type=bind,source=${join(temporary, 'bundle')},target=/bundle,readonly`,
     '--mount', `type=bind,source=${join(temporary, 'sentinel')},target=/sentinel`,
-    workerId, ...cliArguments()], 'Review the synthetic file /bundle/probe.txt.');
+    workerId, ...cliArguments()], 'synthetic-oauth-token\nReview the synthetic file /bundle/probe.txt.');
   } catch { throw new Error('Synthetic CLI execution failed; raw process output is withheld'); }
   const terminal = JSON.parse(raw);
   const fakeState = JSON.parse(docker(['exec', fakeName, 'cat', '/tmp/fake-state.json']));
+  const configuration = docker(['inspect', fakeWorker]);
+  assert.equal(configuration.includes('synthetic-oauth-token'), false, 'Credential must not enter Docker metadata');
+  assert.equal(configuration.includes('CLAUDE_CODE_OAUTH_TOKEN'), false, 'Docker must not store the OAuth environment entry');
+  assert.equal(JSON.parse(configuration)[0].HostConfig.LogConfig.Type, 'none');
+  assert.equal(fakeState.promptCredential, false, 'Credential must not enter model input');
   assert.equal(terminal.subtype, 'success', JSON.stringify({ subtype: terminal.subtype, is_error: terminal.is_error, requests: fakeState.requests, tools: fakeState.tools }));
   assert.equal(terminal.is_error, false);
   assert.deepEqual(terminal.structured_output, { findings: [], priorFindingAssessments: [] });
@@ -190,17 +196,28 @@ try {
   assert.equal(docker(['network', 'ls', '-q', '--filter', `label=${ownerLabel}`]), '');
   assert.deepEqual(readdirSync(owned), []);
   // Parsing all exact flags offline must reach authentication, rather than an unknown-option failure.
-  const flagRun = spawnSync('docker', ['run', '--rm', '-i', '--network', 'none', ...hardened, workerId, ...cliArguments()],
+  const flagRun = spawnSync('docker', ['run', '--rm', '-i', '--network', 'none', ...hardened, '--entrypoint', 'claude', workerId, ...cliArguments()],
     { input: 'Synthetic offline flag check.', encoding: 'utf8', timeout: 15000, maxBuffer: profile.maxOutputBytes, windowsHide: true });
   assert.ok(!/unknown option|unknown argument/i.test(`${flagRun.stdout}${flagRun.stderr}`));
   process.stdout.write(`${JSON.stringify({ workerId, proxyId, runtimeHash: workerRuntimeHash(workerId, proxyId), profile,
     ...probeReport, linuxMaterializedOwnership: true, deniedPaths: 9, upstreamCertificateVerified: true, privateDnsDenied: true,
-    orphanReaped: true, unrelatedResourcesPreserved: true, cancelledAllocationCleaned: true, fakeState, liveInference: false }, null, 2)}\n`);
+    orphanReaped: true, unrelatedResourcesPreserved: true, cancelledAllocationCleaned: true,
+    credentialAbsentFromDockerMetadata: true, credentialAbsentFromModelInput: true, fakeState, liveInference: false }, null, 2)}\n`);
+} catch (error) {
+  failed = true; throw error;
 } finally {
-  for (const name of containers.reverse()) docker(['rm', '-f', name]);
-  for (const name of networks.reverse()) docker(['network', 'rm', name]);
-  for (const name of images.reverse()) docker(['image', 'rm', name]);
-  for (const name of volumes.reverse()) docker(['volume', 'rm', name]);
-  assert.ok(temporary.startsWith(join(process.cwd(), 'worker-acceptance-')));
-  rmSync(temporary, { recursive: true, force: true });
+  const failures: string[] = [];
+  const clean = (label: string, action: () => void) => { try { action(); } catch { failures.push(label); } };
+  for (const name of containers.reverse()) clean(`container ${name}`, () => docker(['rm', '-f', name]));
+  for (const name of networks.reverse()) clean(`network ${name}`, () => docker(['network', 'rm', name]));
+  for (const name of images.reverse()) clean(`image ${name}`, () => docker(['image', 'rm', name]));
+  for (const name of volumes.reverse()) clean(`volume ${name}`, () => docker(['volume', 'rm', name]));
+  clean(`directory ${temporary}`, () => {
+    assert.ok(temporary.startsWith(join(process.cwd(), 'worker-acceptance-')));
+    rmSync(temporary, { recursive: true, force: true });
+  });
+  if (failures.length) {
+    if (failed) process.stderr.write(`${JSON.stringify({ cleanupFailures: failures })}\n`);
+    else throw new Error(`Acceptance cleanup failed: ${failures.join(', ')}`);
+  }
 }

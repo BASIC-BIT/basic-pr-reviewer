@@ -2,6 +2,8 @@
 
 The supervisor runs one pinned Claude Code process per materialized pass. Only the supervisor can obtain the subscription OAuth credential or control Docker. The worker receives the credential in its environment and inert source files through one read-only mount. It has no GitHub client, publication method, cloud credentials or container socket.
 
+Docker container configuration never receives the credential. The supervisor sends a bounded credential line followed by the review request over attached stdin. The trusted image bootstrap consumes exactly that line, then replaces itself with the unmodified pinned CLI and sets the credential only in the new process environment. The remaining stdin reaches the CLI unchanged. Tokens must be 1 through 8192 visible ASCII bytes without whitespace. Malformed framing fails closed with a fixed diagnostic. The bootstrap is verified against the trusted file at startup and included in runtime identity.
+
 ## Caller contract
 
 Build the two images from `worker/Dockerfile` and `worker/proxy.Dockerfile`. Configure their immutable local `sha256:` image IDs, never tags. Keep the trusted `worker/` files beside `dist/` in the service artifact. `createWorker({ workerImage, proxyImage, temporaryRoot, oauthToken })` verifies Linux amd64, Docker 28 or newer, CLI/Node/Squid versions and embedded settings, prompt and proxy configuration. Image provenance remains the operator's responsibility. Version/config checks do not make an arbitrary supplied image trustworthy.
@@ -35,7 +37,7 @@ npm run build
 node scripts/acceptance.ts --worker-profile
 ```
 
-Acceptance uses synthetic credentials and a fixture-only HTTPS origin. It checks actual pinned CLI tools, blocked source hooks/MCP, outside-bundle reads, exact proxy routes, upstream certificate rejection, private DNS, direct host/private/metadata/public access, cancellation, orphan recovery and cleanup. Its provider records assertions and tool names, never request bodies. Unit tests cover output validation, process limits, large stdin and metadata nonpersistence.
+Acceptance uses synthetic credentials and a fixture-only HTTPS origin. It checks actual pinned CLI tools, blocked source hooks/MCP, outside-bundle reads, exact proxy routes, upstream certificate rejection, private DNS, direct host/private/metadata/public access, cancellation, orphan recovery and cleanup. It inspects Docker metadata without printing it and proves the credential and OAuth environment entry are absent while CLI authentication succeeds. The provider also checks that the credential is absent from model input. Its records contain assertions and tool names, never request bodies. Unit tests cover output validation, process limits, large stdin, credential framing, cleanup-failure recovery and metadata nonpersistence.
 
 These checks do not establish subscription entitlement, successful real inference, or production-host networking. The separately authorized hosted pilot must verify the exact image IDs and runtime hash, real subscription authentication and model identity, effective tool/policy behavior, inference-path compatibility and network denials on that host. An unexpected startup endpoint or tool blocks launch. Do not broaden paths, enable remote policy or add API-key fallback to make authentication work. No automatic token refresh or account mutation is supported.
 

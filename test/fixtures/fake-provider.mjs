@@ -2,7 +2,7 @@ import https from 'node:https';
 import http from 'node:http';
 import net from 'node:net';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-const state = { requests: 0, paths: [], tools: [], auth: false, results: [], commandExecuted: false, secretLeaked: false };
+const state = { requests: 0, paths: [], tools: [], auth: false, results: [], commandExecuted: false, secretLeaked: false, promptCredential: false };
 const plan = [
   ['Read', { file_path: '/bundle/probe.txt' }],
   ['Glob', { pattern: '*.txt', path: '/bundle' }],
@@ -34,6 +34,7 @@ https.createServer({ key: readFileSync('/tmp/origin.key'), cert: readFileSync('/
       save(); return;
     }
     const body = JSON.parse(Buffer.concat(chunks).toString());
+    state.promptCredential ||= JSON.stringify(body).includes('synthetic-oauth-token');
     state.auth = request.headers.authorization === 'Bearer synthetic-oauth-token';
     state.tools = (body.tools ?? []).map(t => t.name).sort();
     const results = (body.messages ?? []).flatMap(m => Array.isArray(m.content) ? m.content : []).filter(b => b.type === 'tool_result');

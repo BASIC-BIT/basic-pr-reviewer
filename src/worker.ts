@@ -30,7 +30,7 @@ export function workerRuntimeHash(workerImage: string, proxyImage: string): stri
   const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
   const hash = createHash('sha256').update(readFileSync(new URL(import.meta.url))).update(JSON.stringify({ profile, args: cliArguments(),
     sandbox: sandboxArguments(), workerImage: digest.parse(workerImage), proxyImage: digest.parse(proxyImage) }));
-  for (const name of ['Dockerfile', 'proxy.Dockerfile', 'proxy-entrypoint.sh', 'squid.conf', 'managed-settings.json', 'settings.json', 'mcp.json', 'review-prompt.md']) {
+  for (const name of ['Dockerfile', 'bootstrap.mjs', 'proxy.Dockerfile', 'proxy-entrypoint.sh', 'squid.conf', 'managed-settings.json', 'settings.json', 'mcp.json', 'review-prompt.md']) {
     hash.update(name).update(readFileSync(new URL(`../worker/${name}`, import.meta.url)));
   }
   return hash.digest('hex');
@@ -94,12 +94,13 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
   for (const image of [workerImage, proxyImage]) {
     if (await control(['image', 'inspect', image, '--format', '{{.Os}}/{{.Architecture}}']) !== profile.platform) throw new Error('platform_mismatch');
   }
-  const version = await control(['run', '--rm', '--pull', 'never', '--network', 'none', ...sandboxArguments(), workerImage, '--version']);
+  const version = await control(['run', '--rm', '--pull', 'never', '--network', 'none', ...sandboxArguments(), '--entrypoint', 'claude', workerImage, '--version']);
   if (version !== `${profile.cliVersion} (Claude Code)`) throw new Error('cli_mismatch');
   if (await control(['run', '--rm', '--pull', 'never', '--network', 'none', '--entrypoint', 'node', workerImage, '--version']) !== `v${profile.node}`) throw new Error('node_mismatch');
   if (await control(['run', '--rm', '--pull', 'never', '--network', 'none', '--entrypoint', 'dpkg-query', proxyImage,
     '-W', '-f', '${Version}', 'squid-openssl']) !== profile.squid) throw new Error('proxy_version_mismatch');
   for (const [image, source, destination] of [
+    [workerImage, 'bootstrap.mjs', '/worker/bootstrap.mjs'],
     [workerImage, 'settings.json', '/worker/settings.json'], [workerImage, 'mcp.json', '/worker/mcp.json'],
     [workerImage, 'review-prompt.md', '/worker/review-prompt.md'], [workerImage, 'managed-settings.json', '/etc/claude-code/managed-settings.json'],
     [proxyImage, 'squid.conf', '/etc/squid/squid.conf'], [proxyImage, 'proxy-entrypoint.sh', '/proxy-entrypoint.sh'],
@@ -140,16 +141,16 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
       if (!certificate.startsWith('-----BEGIN CERTIFICATE-----')) throw new Error('proxy_unavailable');
       const caPath = join(temporary, 'ca.pem'); await writeFile(caPath, certificate, { mode: 0o444, flag: 'wx' });
       const token = await options.oauthToken();
-      if (!token || /[\r\n\0]/.test(token)) throw new Error('credential_unavailable');
+      if (!/^[\x21-\x7e]{1,8192}$/.test(token)) throw new Error('credential_unavailable');
       signal.throwIfAborted();
       containers.push(name);
       const created = await runBounded('docker', ['create', '--pull', 'never', '--log-driver', 'none', '--label', ownerLabel, '--name', name, '-i', '--network', internal,
-        ...sandboxArguments(), '--env', 'CLAUDE_CODE_OAUTH_TOKEN', '--env', 'HTTPS_PROXY=http://egress:3128', '--env', 'HTTP_PROXY=http://egress:3128',
+        ...sandboxArguments(), '--env', 'HTTPS_PROXY=http://egress:3128', '--env', 'HTTP_PROXY=http://egress:3128',
         '--env', 'NODE_EXTRA_CA_CERTS=/trust/ca.pem', '--mount', `type=bind,source=${caPath},target=/trust/ca.pem,readonly`,
         '--mount', `type=bind,source=${spec.bundlePath},target=/bundle,readonly`, workerImage, ...cliArguments()],
-      { signal: controlSignal, timeoutMs: 30000, env: { ...hostEnv, CLAUDE_CODE_OAUTH_TOKEN: token } });
+      { signal: controlSignal, timeoutMs: 30000, env: hostEnv });
       if (created.kind !== 'exited') throw new Error('worker_create_failure');
-      const result = await runBounded('docker', ['start', '--attach', '--interactive', name], { signal, timeoutMs: profile.timeoutMs, env: hostEnv, input: prompt });
+      const result = await runBounded('docker', ['start', '--attach', '--interactive', name], { signal, timeoutMs: profile.timeoutMs, env: hostEnv, input: `${token}\n${prompt}` });
       outcome = result.kind === 'failed' ? failedOutcome(spec, result.code)
         : result.stdout.includes(token) ? failedOutcome(spec, 'credential_in_output') : validateOutcome(result.stdout, spec);
     } catch { outcome = failedOutcome(spec, signal.aborted ? 'cancelled' : 'worker_failure'); }
