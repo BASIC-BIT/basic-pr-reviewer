@@ -77,6 +77,8 @@ export function createPublisher(options: {
   readPolicy: (pull: LivePull) => Promise<Pick<TrustedPolicy, 'policy' | 'policyHash'>>;
   notify: (notice: { repositoryId: string; pullNumber: number; reason: string }) => void;
   engineRevision: string; operatorCommand: string;
+  // Optional operator boundary, including compensating writes on older receipts.
+  beforeWrite?: (target: PublicationTarget) => Promise<void>;
 }) {
   const { store, github } = options;
   z.string().min(1).max(200).parse(options.engineRevision);
@@ -117,6 +119,7 @@ export function createPublisher(options: {
     if (found.length === 1) { store.acknowledgePublication(key, found[0]!.id); await guard(target, fence, identity); return; }
     if (record.state === 'sending' || found.length > 1) { notify(target, 'publication_acknowledgement_uncertain'); throw new PendingPublication(); }
     await guard(target, fence, identity);
+    await options.beforeWrite?.(target);
     store.markPublicationSending(key);
     let id: string;
     try { id = await write(marker(key)); }
@@ -197,7 +200,10 @@ export function createPublisher(options: {
     if (undo.state === 'acknowledged') return;
     const thread = (await github.listThreads(operation.target)).find(thread => thread.id === operation.body);
     if (!thread?.owned) throw new PendingPublication();
-    if (thread.resolved) await github.unresolveThread(operation.target, thread.id);
+    if (thread.resolved) {
+      await options.beforeWrite?.(operation.target);
+      await github.unresolveThread(operation.target, thread.id);
+    }
     const after = (await github.listThreads(operation.target)).find(thread => thread.id === operation.body);
     if (!after || after.resolved) throw new PendingPublication();
     store.acknowledgePublication(undo.key, operation.body);
@@ -252,6 +258,7 @@ export function createPublisher(options: {
         const operation = store.planPublicationOperation({ key, fence, target, channel: 'resolve', body: candidate.id });
         if (operation.state === 'acknowledged') continue;
         await guard(target, fence, result.identity);
+        await options.beforeWrite?.(target);
         store.markPublicationSending(key);
         await github.resolveThread(target, candidate.id);
         const after = (await github.listThreads(target)).find(thread => thread.id === candidate.id);

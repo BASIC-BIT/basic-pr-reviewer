@@ -80,6 +80,34 @@ For disaster recovery, stop the service and hold its exclusive lock. Preserve th
 
 ## Release and synthetic acceptance
 
+### Finite GitHub pilot
+
+Live pilot execution needs separate human approval of the target, credential access, input scope, inference budget and publication. CLI flags record operator intent; they do not grant that approval. The two existing synthetic commands below remain offline.
+
+Use the deployed Linux UID1000 host and its fixed `/etc/basic-pr-reviewer/config.json` and `/var/lib/basic-pr-reviewer` paths. The pilot rejects alternate state/configuration paths because Docker worker ownership is host-wide. First obtain a successful `reviewer pause` response with both `paused` and `drained` true, then stop `basic-pr-reviewer.service`. Keep Docker, metadata protection and the production source/worker mounts running. A timeout or failed pause write is not a successful drain.
+
+The selected head must already be durably admitted by the normal service from a real signed eligible event or authorized human rerun. While paused, use `reviewer inspect REPOSITORY_ID PR` to obtain its exact identity. An unseen head cannot be admitted by this runner. Refresh policy/current identity through normal paused service operation if needed, then drain and stop again. Other queued or leased pulls cause refusal, including work scheduled for later. Resolve that queue through normal authorized controls, never delete ledger rows to make the pilot run.
+
+Prepare a private JSON request with `identity` copied from the current admitted record, `coreRevision` and `coreHash` from the verified deployed release, and explicit positive `maxTicks` and `maxElapsedMs`. The identity includes installation/repository IDs, owner/repo, PR number, head/base/merge-base SHAs, base ref, policy/runtime hashes, attempt ID and generation. No field selects policy or an actor. The runner reads the normal live default policy and rejects any identity mismatch.
+
+```sh
+node scripts/acceptance.ts --github-pilot /private/pilot-request.json /private/shadow-report.json --allow-credentials --allow-inference --shadow --drained
+# Only after separate publication/cutover approval:
+node scripts/acceptance.ts --github-pilot /private/pilot-request.json /private/publication-report.json --allow-credentials --allow-inference --allow-publication --drained
+```
+
+Each report path must be unused and on private encrypted storage. The runner reserves it before dependencies or credential reads. It takes the production `service.lock`, verifies real kernel ownership and stopped service, checks durable pause and the exact queued target, and opens no listener or reconciliation loop. Do not pass internal `--locked`; that flag cannot bypass kernel ownership. The compiled `dist/pilot.js` module is included in normal release hashing.
+
+Shadow mode uses the production ledger and constructs no publisher. It saves coverage, findings and pending publication intents for continuation. Its report says `shadow` and contains no publication acknowledgements. These saved intents can publish after a later normal resume. Keep execution paused until explicit publication/cutover approval or cancellation. To abandon a pilot, keep the service paused, apply an approved normal skip label or close the disposable PR, start the service paused and reconcile, then inspect the cancelled/superseded attempt and notices. Neither cancellation nor a restart authorizes publishing notices or other queued work. No ledger editing is required.
+
+At most one pass runs per tick, with the existing 100-turn/60-minute per-pass ceiling. `maxTicks` must be 1 through 1000 and the elapsed limit at most 24 hours. Choose much smaller values for the approved measurement. The deadline aborts active inference and prevents new work/publication boundaries; already-issued requests and cleanup can finish after it. This is not a hard process-kill timer. Provider reset/backoff stops the invocation at its next eligible time instead of sleeping or bypassing quota. Continue with a new explicitly bounded invocation of the same identity. A changed head, base, policy or release requires fresh admission/identity and approval scope review. Completed compatible scope can be reused; failed or incompatible scope cannot certify completion.
+
+The report records exact identity, bounds, elapsed time, executed passes, coverage counts, saved pass outcomes, token estimates, publication receipt IDs and pending intents. Finding/source text, paths and raw diagnostics are omitted. Turns, remaining subscription quota and worker peak memory are `UNKNOWN`; supervisor peak RSS is process-wide and is not worker memory. A refused command exits nonzero with sanitized unknown outcome. An orderly deadline or interruption exits nonzero with saved progress when available. Inspect private ledger/host state before retrying. A report write or cleanup failure is also failure. Nothing resumes the normal service. Hard kill or host failure may leave owned allocations for normal locked startup recovery.
+
+The synthetic runner tests cover finite progress, refusal, shadow/publication separation and invented 66-file exhaustion/continuation. Existing source, worker and lifecycle suites cover containment and cleanup. They do not prove live App permissions, subscription capacity, host isolation, alarm delivery or a deployment.
+
+`pendingIntents` counts current planned ledger intents. The ledger retains these for reconciliation even after individual operations are acknowledged; use publication outcomes and operation receipts to determine remote completion.
+
 From a clean committed checkout after `npm ci` and `npm run build`, generate a manifest using the immutable image IDs:
 
 ```sh

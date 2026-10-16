@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { openStore } from '../src/store.js';
 import { createPublisher, sanitizeText, findingAnchor } from '../src/publisher.js';
 import { repoPolicySchema } from '../src/contracts.js';
-import type { LivePull, ReviewResult, Store } from '../src/contracts.js';
+import type { LivePull, PublicationTarget, ReviewResult, Store } from '../src/contracts.js';
 import { GitHubAccessError } from '../src/github.js';
 import type { PublicationGitHubPort, OwnedPublication, ReviewThread } from '../src/github.js';
 
@@ -54,7 +54,7 @@ function setup(change: (result: ReviewResult) => void = () => {}, database = ':m
     async resolveThread(_target, id) { threads.find((item) => item.id === id)!.resolved = true; mutate?.(); },
     async unresolveThread(_target, id) { threads.find((item) => item.id === id)!.resolved = false; },
   };
-  const publisher = (readPolicy = async () => ({ policy: repoPolicySchema.parse({ schemaVersion: 1, enabled: true }), policyHash })) => createPublisher({ store, github, readPolicy,
+  const publisher = (readPolicy = async () => ({ policy: repoPolicySchema.parse({ schemaVersion: 1, enabled: true }), policyHash }), beforeWrite?: (target: PublicationTarget) => Promise<void>) => createPublisher({ store, github, readPolicy, ...(beforeWrite ? { beforeWrite } : {}),
     notify: notice => { notices.push(notice.reason); }, engineRevision: 'fixture-engine', operatorCommand: 'reviewer inspect' });
   return { store, identity, result, owned, threads, publisher, github, notices, checks, live: () => live, setPolicy: () => { policyHash = 'f'.repeat(64); }, setLive: (value: Partial<LivePull>) => { live = { ...live, ...value }; },
     loseReview: () => { loseReview = true; }, mutate: (value: (() => void) | null) => { mutate = value; }, calls: () => calls };
@@ -196,6 +196,35 @@ describe('safe publication', () => {
     expect(operation.state).toBe('sending');
     return { ...f, record, operation, resolves: () => resolves };
   }
+  it('refuses a repair write without acknowledging it, then permits normal recovery', async () => {
+    const f = await lostResolution(); f.setLive({ headSha: '9'.repeat(40) });
+    const publisher = f.publisher(undefined, async target => { expect(target).toEqual(f.operation.target); throw new Error('pilot boundary'); });
+    expect((await publisher.reconcilePublication(f.record)).status).toBe('pending');
+    expect(f.threads[0]!.resolved).toBe(true);
+    expect(f.store.publicationOperations('2', 3).find(item => item.key === f.operation.key)?.state).toBe('sending');
+    expect(f.store.publicationOperations('2', 3).filter(item => item.channel === 'unresolve').every(item => item.state !== 'acknowledged')).toBe(true);
+    await f.publisher().reconcilePublication(f.record);
+    expect(f.threads[0]!.resolved).toBe(false);
+    expect(f.store.publicationOperations('2', 3).find(item => item.key === f.operation.key)?.state).toBe('acknowledged');
+  });
+  it('guards summary, check, inline, resolution and compensating writes individually', async () => {
+    const f = setup(), seen = new Set<string>(); let permitted = false;
+    const publisher = f.publisher(undefined, async target => { expect(target.headSha).toBe(input.headSha); permitted = true; });
+    function checked(name: string) { expect(permitted, name).toBe(true); permitted = false; seen.add(name); }
+    const original = { ...f.github };
+    f.github.upsertSummary = async (...args) => { checked('summary'); return original.upsertSummary(...args); };
+    f.github.upsertCheck = async (...args) => { checked('check'); return original.upsertCheck(...args); };
+    f.github.createReview = async (...args) => { checked('inline'); return original.createReview(...args); };
+    f.github.resolveThread = async (...args) => { checked('resolve'); await original.resolveThread(...args); f.threads[0]!.hasReplies = true; };
+    f.github.unresolveThread = async (...args) => { checked('unresolve'); return original.unresolveThread(...args); };
+    expect((await publisher.publishReview(f.result)).status).toBe('published');
+    const next = f.store.admit({ schemaVersion: 1, deliveryId: 'rerun', receivedAt: 3, expectedGeneration: 1, identity: input, trigger: { kind: 'rerun', sequence: 1 } });
+    const result = { ...f.result, identity: next.identity, generation: 2, findings: [], priorFindingAssessments: [{ findingId: 'finding-one', assessment: 'fixed' as const }] };
+    const claim = f.store.claim(4)!; f.store.settle(next.identity, { token: claim.lease.token, now: 5 }, { state: 'complete', result, reason: null, nextAttemptAt: 5 });
+    expect((await publisher.publishReview(result)).status).toBe('published');
+    expect([...seen].sort()).toEqual(['check', 'inline', 'resolve', 'summary', 'unresolve']);
+    expect(f.threads[0]!.resolved).toBe(false);
+  });
   it.each(['headSha', 'baseSha', 'baseRef', 'mergeBaseSha', 'policy'] as const)('undoes a recovered resolution when live %s changed before admission', async field => {
     const f = await lostResolution();
     const observation = f.store.observation('2', 3);

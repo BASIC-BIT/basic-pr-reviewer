@@ -1,4 +1,4 @@
-// Local synthetic acceptance only. This command never reads an OAuth credential.
+// Synthetic modes are offline. The explicit github-pilot mode requires separately approved live authority.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
@@ -9,9 +9,16 @@ import { cliArguments, profile, workerRuntimeHash, sandboxArguments, validateOut
 import { passSpecSchema } from '../dist/contracts.js';
 import { writeRelease, verifyRelease } from '../dist/release.js';
 import { navigationAlias, renderNavigation, passContextHash } from '../dist/source.js';
+import { runPilotCli } from '../dist/pilot.js';
+
+if (process.argv[2] === '--github-pilot') {
+  try { await runPilotCli(process.argv.slice(3)); }
+  catch { process.stderr.write('Pilot refused. Check explicit intent, production ownership and private inputs.\n'); process.exitCode = 1; }
+  process.exit(process.exitCode ?? 0);
+}
 
 if (process.argv[2] === '--fake-container') {
-  const result = spawnSync(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', 'test/lifecycle.test.ts', 'test/worker-lifecycle.test.ts', 'test/retention.test.ts', 'test/runtime.test.ts'], { stdio: 'inherit', windowsHide: true });
+  const result = spawnSync(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '--maxWorkers=1', '--testTimeout=60000', 'test/lifecycle.test.ts', 'test/worker-lifecycle.test.ts', 'test/retention.test.ts', 'test/runtime.test.ts', 'test/pilot.test.ts'], { stdio: 'inherit', windowsHide: true });
   assert.equal(result.status, 0, 'Synthetic lifecycle acceptance failed');
   process.exit(0);
 }
