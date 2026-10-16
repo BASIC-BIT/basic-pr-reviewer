@@ -2,7 +2,7 @@
 
 The host configures the GitHub App ID, signing key, webhook secret, approved immutable GitHub owner/account IDs, and central runtime hash. Keep GitHub and host secrets outside worker processes. The isolated CLI receives only its subscription OAuth credential. See [worker configuration and acceptance](worker.md) for image pins, Linux ownership, startup recovery and the network boundary. Installation IDs are discovered from the App and live-verified against approved account IDs. They are operational inventory, not another enrollment requirement. Signed installation events cannot approve an owner.
 
-Select repositories in GitHub's installation settings. A selected repository under an approved owner opts in with `.github/claude-review.json` and `REVIEW.md` on its trusted base branch. No reviewer workflow YAML is required. A newly selected repository under an approved owner needs no per-repository host entry. Repository transfers outside the approved owner boundary fail closed. Installation tokens never fall back to another installation or a personal token.
+Select repositories in GitHub's installation settings. A selected repository under an approved owner opts in with `.github/claude-review.json` and `REVIEW.md` on its live default branch. The service rejects nondefault bases before reading their policies. No reviewer workflow YAML is required. A newly selected repository under an approved owner needs no per-repository host entry. Repository transfers outside the approved owner boundary fail closed. Installation tokens never fall back to another installation or a personal token.
 
 The smallest policy is:
 
@@ -17,7 +17,7 @@ The smallest policy is:
 
 ## Local policy fields
 
-Unknown fields, unsupported versions, unsafe instruction paths, missing required files, and invalid JSON fail closed. Admission returns a durable `configuration_failure` with no queued inference. The host must present that failure; GitHub check/summary publication is implemented separately.
+Unknown fields, unsupported versions, unsafe instruction paths, missing required files, and invalid JSON fail closed. Admission returns a durable `configuration_failure` with no queued inference. The service retains and publishes that failure through its notice ledger. See [service operations](operations.md) for startup, controls, retention, and actor-provenance limits.
 
 | Field | Default | Meaning |
 | --- | --- | --- |

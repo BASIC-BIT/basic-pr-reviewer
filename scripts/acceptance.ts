@@ -7,8 +7,14 @@ import { resolve, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { cliArguments, profile, workerRuntimeHash, sandboxArguments, validateOutcome, createWorker } from '../dist/worker.js';
 import { passSpecSchema } from '../dist/contracts.js';
+import { writeRelease, verifyRelease } from '../dist/release.js';
 import { navigationAlias, renderNavigation, passContextHash } from '../dist/source.js';
 
+if (process.argv[2] === '--fake-container') {
+  const result = spawnSync(process.execPath, ['node_modules/vitest/vitest.mjs', 'run', 'test/lifecycle.test.ts', 'test/worker-lifecycle.test.ts', 'test/retention.test.ts', 'test/runtime.test.ts'], { stdio: 'inherit', windowsHide: true });
+  assert.equal(result.status, 0, 'Synthetic lifecycle acceptance failed');
+  process.exit(0);
+}
 assert.equal(process.argv[2], '--worker-profile');
 const worker = process.argv[3], proxy = process.argv[4];
 assert.match(worker ?? '', /^sha256:[a-f0-9]{64}$/); assert.match(proxy ?? '', /^sha256:[a-f0-9]{64}$/);
@@ -193,7 +199,10 @@ try {
   const fixtureId = docker(['image', 'inspect', fixtureTag, '--format', '{{.Id}}']);
   const owned = join(temporary, 'owned'), emptyBundle = join(temporary, 'inert'); mkdirSync(owned); mkdirSync(emptyBundle);
   mkdirSync(join(emptyBundle, 'data')); mkdirSync(join(emptyBundle, 'quarantine'));
-  const service = await createWorker({ workerImage: workerId, proxyImage: fixtureId, temporaryRoot: owned, oauthToken: async () => 'synthetic-oauth-token' });
+  const manifestPath = join(temporary, 'release.json');
+  await writeRelease(process.cwd(), manifestPath, workerId, fixtureId);
+  const release = await verifyRelease(process.cwd(), manifestPath);
+  const service = await createWorker({ release, workerImage: workerId, proxyImage: fixtureId, temporaryRoot: owned, oauthToken: async () => 'synthetic-oauth-token' });
   const ownerLabel = 'io.basic-pr-reviewer.owner=worker-service';
   assert.equal(docker(['ps', '-aq', '--filter', `label=${ownerLabel}`]), '', 'Acceptance requires an idle worker service');
   assert.equal(docker(['network', 'ls', '-q', '--filter', `label=${ownerLabel}`]), '', 'Acceptance requires an idle worker service');
@@ -231,7 +240,7 @@ try {
   const flagRun = spawnSync('docker', ['run', '--rm', '-i', '--network', 'none', ...hardened, '--entrypoint', 'claude', workerId, ...cliArguments()],
     { input: 'Synthetic offline flag check.', encoding: 'utf8', timeout: 15000, maxBuffer: profile.maxOutputBytes, windowsHide: true });
   assert.ok(!/unknown option|unknown argument/i.test(`${flagRun.stdout}${flagRun.stderr}`));
-  process.stdout.write(`${JSON.stringify({ workerId, proxyId, runtimeHash: workerRuntimeHash(workerId, proxyId), profile,
+  process.stdout.write(`${JSON.stringify({ workerId, proxyId, runtimeHash: service.runtimeHash, coreRevision: release.coreRevision, coreHash: release.coreHash, profile,
     ...probeReport, linuxMaterializedOwnership: true, deniedPaths: 9, upstreamCertificateVerified: true, privateDnsDenied: true,
     orphanReaped: true, unrelatedResourcesPreserved: true, cancelledAllocationCleaned: true,
     credentialAbsentFromDockerMetadata: true, credentialAbsentFromModelInput: true, fakeState,

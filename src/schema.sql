@@ -8,6 +8,7 @@ CREATE TABLE pulls (
   observed_base_ref TEXT,
   current_attempt_id INTEGER REFERENCES attempts(id),
   updated_at INTEGER NOT NULL,
+  closed_at INTEGER,
   PRIMARY KEY (repository_id, pull_number)
 ) STRICT;
 
@@ -75,6 +76,8 @@ CREATE TABLE publications (
 
 CREATE TABLE webhook_receipts (
   id TEXT PRIMARY KEY,
+  repository_id TEXT,
+  pull_number INTEGER,
   result_json TEXT NOT NULL CHECK (json_valid(result_json)),
   received_at INTEGER NOT NULL
 ) STRICT;
@@ -98,4 +101,4 @@ CREATE TABLE publication_operations (
   operation_json TEXT NOT NULL CHECK(json_valid(operation_json)),
   FOREIGN KEY(repository_id, pull_number) REFERENCES pulls(repository_id, pull_number)
 ) STRICT;
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

@@ -89,13 +89,13 @@ export function openStore(path: string): Store {
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     const { user_version: version } = z.object({ user_version: z.number().int() })
       .parse(db.prepare('PRAGMA user_version').get());
-    if (![0, 2, 3, 4].includes(version)) throw new Error(`Unsupported schema version ${version}`);
+    if (![0, 2, 3, 4, 5].includes(version)) throw new Error(`Unsupported schema version ${version}`);
     db.exec('PRAGMA journal_mode = WAL');
     if (version === 0) {
       transaction(() => {
         const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
         if (current.user_version === 0) db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
-        else if (current.user_version !== 4) throw new Error(`Unsupported schema version ${current.user_version}`);
+        else if (current.user_version !== 5) throw new Error(`Unsupported schema version ${current.user_version}`);
       });
     }
     if (version === 2) transaction(() => {
@@ -116,6 +116,7 @@ export function openStore(path: string): Store {
     transaction(() => {
       const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
       if (current.user_version === 3) db.exec(publicationTables);
+      if (current.user_version === 3 || current.user_version === 4) db.exec('ALTER TABLE pulls ADD COLUMN closed_at INTEGER; ALTER TABLE webhook_receipts ADD COLUMN repository_id TEXT; ALTER TABLE webhook_receipts ADD COLUMN pull_number INTEGER; PRAGMA user_version = 5;');
     });
   } catch (error) {
     db.close();
@@ -378,13 +379,17 @@ export function openStore(path: string): Store {
       transaction(() => {
         const owner = assertOwner(identity, ownership);
         const specJson = JSON.stringify(spec);
-        const outcomeJson = JSON.stringify(outcome);
+        let outcomeJson = JSON.stringify(outcome);
         const existing = db.prepare('SELECT * FROM passes WHERE attempt_id = ? AND pass_id = ?').get(identity.attemptId, spec.id);
         if (existing) {
           const saved = readPass(existing, identity);
           if (JSON.stringify(saved.spec) !== specJson) throw new Error('Pass specification is immutable');
           if (JSON.stringify(saved.outcome) === outcomeJson) return;
           if (saved.outcome.status === 'completed') throw new Error('Completed pass is immutable');
+          // A retry is not evidence that a previously validated finding disappeared.
+          const findings = new Map(saved.outcome.findings.map(finding => [finding.id, finding]));
+          for (const finding of outcome.findings) findings.set(finding.id, finding);
+          outcomeJson = JSON.stringify({ ...outcome, findings: [...findings.values()] });
         }
         const now = owner.now;
         db.prepare('INSERT INTO passes (attempt_id, pass_id, spec_json, outcome_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id, pass_id) DO UPDATE SET outcome_json = excluded.outcome_json, updated_at = excluded.updated_at')
@@ -419,18 +424,22 @@ export function openStore(path: string): Store {
     trackedPulls(installationId) {
       return db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
         .map(readAttempt).filter((record) => record.identity.installationId === installationId)
-        .map((record) => ({ repositoryId: record.identity.repositoryId, pullNumber: record.identity.pullNumber }));
+        .map((record) => ({ repositoryId: record.identity.repositoryId, pullNumber: record.identity.pullNumber }))
+        .concat(db.prepare('SELECT notice_json FROM publication_notices').all().map(row => publicationNoticeSchema.parse(JSON.parse(z.object({ notice_json: z.string() }).parse(row).notice_json)))
+          .filter(notice => notice.target.installationId === installationId).map(notice => ({ repositoryId: notice.target.repositoryId, pullNumber: notice.target.pullNumber })))
+        .filter((pull, index, all) => all.findIndex(other => other.repositoryId === pull.repositoryId && other.pullNumber === pull.pullNumber) === index);
     },
     trackedInstallations() {
       return [...new Set(db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
-        .map(readAttempt).map((record) => record.identity.installationId))];
+        .map(readAttempt).map((record) => record.identity.installationId)
+        .concat(db.prepare('SELECT notice_json FROM publication_notices').all().map(row => publicationNoticeSchema.parse(JSON.parse(z.object({ notice_json: z.string() }).parse(row).notice_json)).target.installationId)))];
     },
     invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef, live) {
       timestampSchema.parse(expectedGeneration);
       transaction(() => {
         if (live && (live.repositoryId !== repositoryId || live.pullNumber !== pullNumber || live.headSha !== headSha || live.baseRef !== baseRef)) throw new Error('Notice destination mismatch');
         invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef);
-        if (live) recordNotice(live, expectedGeneration + 1, reason === 'configuration_failure' ? 'configuration_failure'
+        if (live) recordNotice(live, expectedGeneration + 1, ['configuration_failure', 'actor_provenance_unknown', 'untrusted_base'].includes(reason) ? 'configuration_failure'
           : ['base_changed', 'retarget', 'publication_outdated', 'superseded', 'policy_changed'].includes(reason) ? 'outdated' : 'cancelled', reason);
       });
     },
@@ -454,9 +463,10 @@ export function openStore(path: string): Store {
       const value = db.prepare('SELECT result_json FROM webhook_receipts WHERE id = ?').get(deliveryId);
       return value ? webhookAdmissionSchema.parse(JSON.parse(z.object({ result_json: z.string() }).parse(value).result_json)) : null;
     },
-    acknowledge(deliveryId, input) {
+    acknowledge(deliveryId, input, target) {
       const admission = webhookAdmissionSchema.parse(input);
-      db.prepare('INSERT INTO webhook_receipts VALUES (?, ?, ?) ON CONFLICT DO NOTHING').run(deliveryId, JSON.stringify(admission), Date.now());
+      db.prepare('INSERT INTO webhook_receipts(id, result_json, received_at, repository_id, pull_number) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING')
+        .run(deliveryId, JSON.stringify(admission), Date.now(), target?.repositoryId ?? null, target?.pullNumber ?? null);
     },
     planPublication(input, ownership) {
       const intent = publicationIntentSchema.parse(input);
@@ -519,6 +529,40 @@ export function openStore(path: string): Store {
     acknowledgePublication(key, remoteId) {
       z.string().min(1).parse(remoteId);
       transaction(() => { const saved = operation(key); saveOperation({ ...saved, state: 'acknowledged', remoteId }); });
+    },
+    interruptLeases(now) {
+      timestampSchema.parse(now);
+      db.prepare("UPDATE attempts SET lease_expires_at = ? WHERE state = 'leased'").run(now);
+    },
+    observePullState(repositoryId, pullNumber, state, now) {
+      timestampSchema.parse(now);
+      db.prepare(`INSERT INTO pulls(repository_id, pull_number, updated_at, closed_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(repository_id, pull_number) DO UPDATE SET closed_at = CASE WHEN ? = 'open' THEN NULL ELSE COALESCE(pulls.closed_at, excluded.closed_at) END`)
+        .run(repositoryId, pullNumber, now, state === 'closed' ? now : null, state);
+    },
+    purgeClosedBefore(cutoff) {
+      timestampSchema.parse(cutoff);
+      return transaction(() => {
+        const expired = db.prepare('SELECT repository_id, pull_number FROM pulls WHERE closed_at IS NOT NULL AND closed_at <= ?').all(cutoff);
+        for (const row of expired) {
+          const { repository_id: repositoryId, pull_number: pullNumber } = z.object({ repository_id: z.string(), pull_number: z.number() }).parse(row);
+          db.prepare('DELETE FROM webhook_receipts WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
+          const attempts = 'SELECT id FROM attempts WHERE repository_id = ? AND pull_number = ?';
+          db.prepare(`DELETE FROM webhook_receipts WHERE json_extract(result_json, '$.attemptId') IN (${attempts})`).run(repositoryId, pullNumber);
+          for (const table of ['deliveries', 'passes', 'publications', 'pass_executions']) db.prepare(`DELETE FROM ${table} WHERE attempt_id IN (${attempts})`).run(repositoryId, pullNumber);
+          for (const table of ['publication_operations', 'publication_notices']) db.prepare(`DELETE FROM ${table} WHERE repository_id = ? AND pull_number = ?`).run(repositoryId, pullNumber);
+          db.prepare('UPDATE pulls SET current_attempt_id = NULL WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
+          db.prepare('DELETE FROM attempts WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
+          db.prepare('DELETE FROM pulls WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
+        }
+        db.prepare('DELETE FROM webhook_receipts WHERE repository_id IS NULL AND received_at <= ?').run(cutoff);
+        return expired.length;
+      });
+    },
+    health() {
+      const count = (sql: string) => z.object({ count: z.number() }).parse(db.prepare(sql).get()).count;
+      return { workerFailures: count("SELECT count(*) AS count FROM attempts a JOIN pulls p ON p.current_attempt_id = a.id WHERE a.state != 'superseded' AND a.terminal_state IN ('incomplete','intervention')"),
+        publicationFailures: count("SELECT count(*) AS count FROM publication_operations WHERE json_extract(operation_json, '$.state') = 'sending'") };
     },
     async backup(destination) {
       await backup(db, destination);

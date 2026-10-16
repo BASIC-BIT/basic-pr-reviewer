@@ -9,6 +9,7 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const marker = (key: string) => `<!-- subscription-review:${key} -->`;
 const sticky = '<!-- subscription-review:summary -->';
+const partMarker = (id: string, part: number) => `<!-- subscription-finding-part:${hash([id, part])} -->`;
 const findingMarker = (id: string) => `<!-- subscription-finding:${hash(id)} -->`;
 const progressSchema = z.object({ state: z.enum(['queued', 'leased', 'complete', 'incomplete', 'intervention']),
   reason: z.string().nullable(), nextAttemptAt: z.number(), result: reviewResultSchema.nullable() });
@@ -127,8 +128,11 @@ export function createPublisher(options: {
     channel: 'summary' | 'check', body: string, check: Omit<CheckPublication, 'body'>): Promise<void> {
     await guard(target, fence, identity);
     const owned = await github.listOwnedPublications(target), receipts = store.publicationOperations(target.repositoryId, target.pullNumber);
-    const previous = owned.find(item => item.channel === channel && (channel !== 'check' || item.headSha === check.headSha) &&
-      receipts.some(receipt => receipt.channel === channel && (receipt.remoteId === item.id || item.body.includes(marker(receipt.key)))));
+    const candidates = owned.filter(item => item.channel === channel && (channel !== 'check' || item.headSha === check.headSha) &&
+      (receipts.some(receipt => receipt.channel === channel && (receipt.remoteId === item.id || item.body.includes(marker(receipt.key)))) ||
+        (channel === 'summary' ? item.body.startsWith(sticky + '\n') : /^<!-- subscription-review:[a-f0-9]{64} -->\n/.test(item.body))));
+    if (candidates.length > 1) throw new PendingPublication();
+    const previous = candidates[0];
     if (!previous && receipts.some(receipt => receipt.channel === channel && receipt.state === 'sending' &&
       (channel === 'summary' || receipt.target.headSha === target.headSha))) throw new PendingPublication();
     await mutate(target, fence, identity, channel, { body, check }, async operationMarker => {
@@ -139,7 +143,7 @@ export function createPublisher(options: {
   }
   function render(record: PublicationRecord, progress: z.infer<typeof progressSchema>) {
     const { identity } = record.intent, result = progress.result;
-    const lines = ['## Subscription review', `Attempt ${identity.attemptId}. Private operator lookup: \`${sanitizeText(options.operatorCommand)} ${identity.attemptId}\`.`,
+    const lines = ['## Subscription review', `Attempt ${identity.attemptId}. Private operator lookup: \`${sanitizeText(options.operatorCommand)} ${identity.repositoryId} ${identity.pullNumber}\`.`,
       `Head \`${identity.headSha}\`. Base ${sanitizeText(identity.baseRef)} \`${identity.baseSha}\`.`,
       `State: ${progress.state}. ${result?.complete ? 'Complete supplied coverage.' : 'Coverage is incomplete or not yet reviewed.'}`,
       `Fresh units: ${(result?.coveredUnitIds.length ?? 0) - (result?.reusedUnitIds.length ?? 0)}. Reused units: ${result?.reusedUnitIds.length ?? 0}. Missing units: ${result?.missingUnitIds.length ?? 0}.`,
@@ -170,7 +174,7 @@ export function createPublisher(options: {
     if (included < findingTexts.length) lines.push(`${findingTexts.length - included} further findings follow in commit-scoped review batches. Every finding is retained in the private attempt record.`);
     return { body: lines.join('\n\n'), findingTexts };
   }
-  async function findingAlreadyPublished(identity: ReviewIdentity, findingId: string, part: number): Promise<boolean> {
+  async function findingAlreadyPublished(identity: ReviewIdentity, findingId: string, part: number, text: string): Promise<boolean> {
     const target = destination(identity), intents = store.publications(identity.repositoryId, identity.pullNumber);
     for (const operation of store.publicationOperations(identity.repositoryId, identity.pullNumber)) {
       if (operation.channel !== 'inline' || operation.state === 'planned' || operation.fence.kind !== 'review') continue;
@@ -183,7 +187,10 @@ export function createPublisher(options: {
       if (remote.length === 1) { store.acknowledgePublication(operation.key, remote[0]!.id); return true; }
       throw new PendingPublication();
     }
-    return false;
+    // Retention removes coverage, but an identical App-owned publication need not be posted twice.
+    const owned = (await github.listOwnedPublications(target)).filter(item => item.channel === 'inline' && item.headSha === target.headSha);
+    const threads = part === 0 ? await github.listThreads(target) : [];
+    return owned.some(item => item.body.includes(partMarker(findingId, part)) && item.body.endsWith('\n' + text) || threads.some(thread => thread.owned && thread.reviewId === item.id && thread.body === text));
   }
   async function undoResolution(operation: PublicationOperation): Promise<void> {
     const undo = store.planPublicationUndo(operation.key);
@@ -275,11 +282,11 @@ export function createPublisher(options: {
           const parts = chunks(text, 40_000), anchor = findingAnchor(result, finding);
           for (const [part, value] of parts.entries()) {
             await guard(target, fence, identity);
-            if (await findingAlreadyPublished(identity, finding.id, part)) continue;
+            if (await findingAlreadyPublished(identity, finding.id, part, value)) continue;
             const comments: InlineComment[] = anchor && part === 0 ? [{ ...anchor, body: value }] : [];
             const batchBody = comments.length ? `Finding ${index + 1} of ${result.findings.length}.` : value;
             await mutate(target, fence, identity, 'inline', { findingId: finding.id, part, comments, batchBody }, operationMarker =>
-              github.createReview(target, { commitId: identity.headSha, body: `${operationMarker}\n${batchBody}`, comments }), `${index}:${part}`);
+              github.createReview(target, { commitId: identity.headSha, body: `${operationMarker}\n${partMarker(finding.id, part)}\n${batchBody}`, comments }), `${index}:${part}`);
           }
         }
         await cleanup(result, fence);
@@ -329,7 +336,7 @@ export function createPublisher(options: {
       await recoverResolutions(target);
       const owned = await github.listOwnedPublications(target);
       const receipts = store.publicationOperations(target.repositoryId, target.pullNumber);
-      if (notice.kind !== 'configuration_failure' && !owned.some(item => item.channel === 'summary' && receipts.some(operation => operation.channel === 'summary' && (operation.remoteId === item.id || item.body.includes(marker(operation.key)))))) return { status: 'published', reason: 'no_existing_review' };
+      if (notice.kind !== 'configuration_failure' && !owned.some(item => item.channel === 'summary' && (item.body.startsWith(sticky + '\n') || receipts.some(operation => operation.channel === 'summary' && (operation.remoteId === item.id || item.body.includes(marker(operation.key))))))) return { status: 'published', reason: 'no_existing_review' };
       const body = `## Subscription review\n\n${notice.kind === 'outdated' ? 'Comparison outdated' : notice.kind === 'cancelled' ? 'Review cancelled' : 'Configuration failure'}. Reason: ${sanitizeText(notice.reason)}.\n\nCurrent head \`${target.headSha}\`, base \`${target.baseSha}\`. Previous findings remain historical evidence.\n\n${notice.reviewedIdentity ? `Reviewed attempt ${notice.reviewedIdentity.attemptId}, head ${notice.reviewedIdentity.headSha}, base ${notice.reviewedIdentity.baseSha}.` : 'No review attempt was admitted.'}`;
       for (const channel of ['summary', 'check'] as const) await summaryAndCheck(target, fence, null, channel, body,
         { headSha: target.headSha, status: 'completed', conclusion: notice.kind === 'cancelled' ? 'cancelled' : 'neutral' });

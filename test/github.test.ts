@@ -6,7 +6,7 @@ import { openStore } from '../src/store.js';
 
 const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const head = 'a'.repeat(40), base = 'b'.repeat(40), merge = 'c'.repeat(40);
-const repo = { id: 200, name: 'fixture', owner: { id: 400, login: 'trusted-owner' } };
+const repo = { default_branch: 'main', id: 200, name: 'fixture', owner: { id: 400, login: 'trusted-owner' } };
 const live = { number: 42, state: 'open', draft: false, user: { login: 'author', type: 'User' }, labels: [],
   head: { sha: head, repo: { id: 200 } }, base: { sha: base, ref: 'main', repo: { id: 200 } } };
 function setup(handler?: (path: string) => { status: number; data: unknown; headers?: Record<string, string> } | undefined) {

@@ -402,9 +402,9 @@ describe('ledger scheduler', { timeout: 120000 }, () => {
     expect(current?.result?.failureCodes).toContain('retrieval_failed');
   });
 
-  it.each([undefined, {}])('stops a Git credential authentication failure before inference with response %j', async response => {
+  it.each([{ status: 401, response: undefined }, { status: 401, response: {} }, { status: 403, response: {} }])('stops a Git credential authentication failure before inference with response %j', async ({ status, response }) => {
     const f = await setup();
-    const credential = vi.fn(async (): Promise<string> => { throw { status: 401, response, message: 'SECRET_AUTH_MESSAGE' }; });
+    const credential = vi.fn(async (): Promise<string> => { throw { status, response, message: 'SECRET_AUTH_MESSAGE' }; });
     const source = await createSourceService({ root: await temp(), credential });
     await createScheduler({ ...f.ports, source }).tick(f.now());
     expect(credential).toHaveBeenCalledOnce();

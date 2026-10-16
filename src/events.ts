@@ -33,9 +33,10 @@ function ineligible(pull: LivePull, policy: RepoPolicy, actor: Actor | null): st
 
 export function createAdmissionService(options: {
   store: Store; github: AdmissionGitHubPort; webhookSecret: string; appId: string;
-  ownerIds: string[]; runtimeHash: string;
+  ownerIds: string[]; runtimeHash: string; now?: () => number;
 }) {
   const { store, github } = options;
+  const now = options.now ?? Date.now;
   if (!options.webhookSecret) throw new Error('A webhook signing secret is required');
   z.string().regex(/^[0-9a-f]{64}$/).parse(options.runtimeHash);
   const verifier = new Webhooks({ secret: options.webhookSecret });
@@ -67,6 +68,7 @@ export function createAdmissionService(options: {
           store.invalidatePull(context.repositoryId, context.pullNumber, observed.generation, reason, pull.headSha, pull.baseRef, pull);
           return { kind: 'cancelled', reason };
         }
+        store.observePullState(pull.repositoryId, pull.pullNumber, pull.state, pull.closedAt ?? now());
         if (context.kind === 'base') {
           if (pull.baseRef !== context.action) return ignored('unrelated_base');
           return cancel('base_changed');
@@ -78,6 +80,7 @@ export function createAdmissionService(options: {
         const current = store.current(context.repositoryId, context.pullNumber);
         if (context.kind !== 'rerun' && current && current.identity.headSha === pull.headSha &&
           (current.identity.baseSha !== pull.baseSha || current.identity.mergeBaseSha !== pull.mergeBaseSha)) return cancel('base_changed');
+        if (await github.readDefaultBranch(pull.installationId, pull.repositoryId) !== pull.baseRef) return cancel('untrusted_base');
         let trusted;
         try { trusted = await loadPolicy(github, pull); }
         catch (error) {
@@ -88,6 +91,7 @@ export function createAdmissionService(options: {
         const reason = ineligible(pull, trusted.policy, context.actor);
         if (reason) return cancel(reason);
         if (context.kind === 'reconcile' && observed.blockedReason === 'bot_actor' && observed.observedHeadSha === pull.headSha) return ignored('waiting_for_authorized_actor');
+        if (context.kind === 'reconcile' && (!current || current.identity.headSha !== pull.headSha)) return cancel('actor_provenance_unknown');
         if (context.kind === 'automatic') {
           if (context.action === 'labeled' || context.action === 'unlabeled') {
             if (!context.label || !trusted.policy.skipLabels.includes(context.label)) return ignored('irrelevant_label');
@@ -112,7 +116,7 @@ export function createAdmissionService(options: {
         }
         if (store.observation(context.repositoryId, context.pullNumber).generation !== observed.generation || store.accessGeneration() !== accessGeneration) throw new StaleAdmissionObservationError();
         const admitted = store.admit({ schemaVersion: 1, deliveryId: context.commandKey ?? context.deliveryId,
-          receivedAt: Date.now(), expectedGeneration: observed.generation, expectedAccessGeneration: accessGeneration,
+          receivedAt: now(), expectedGeneration: observed.generation, expectedAccessGeneration: accessGeneration,
           trigger: context.kind === 'rerun' ? { kind: 'rerun', sequence: observed.rerunSequence + 1 } : { kind: 'automatic' },
           identity: { installationId: pull.installationId, repositoryId: pull.repositoryId, owner: pull.owner, repo: pull.repo,
             pullNumber: pull.pullNumber, headSha: pull.headSha, baseRef: pull.baseRef, baseSha: pull.baseSha,
@@ -142,6 +146,7 @@ export function createAdmissionService(options: {
     const common = z.object({ installation: z.object({ id }), action: z.string().optional() }).parse(raw);
     const installationId = common.installation.id;
     let result: WebhookAdmission;
+    let receiptTarget: { repositoryId: string; pullNumber: number } | undefined;
     if (event === 'installation' || event === 'installation_repositories') {
       const owner = z.object({ installation: z.object({ account: z.object({ id }) }) }).parse(raw).installation.account.id;
       if (!owners.has(owner)) throw new Error('Unapproved installation owner');
@@ -175,15 +180,18 @@ export function createAdmissionService(options: {
       if (event === 'pull_request') {
         const value = z.object({ action: z.string(), number, pull_request: z.object({ number }), label: z.object({ name: z.string() }).optional() }).parse(raw);
         if (value.number !== value.pull_request.number) throw new Error('Webhook pull number mismatch');
+        receiptTarget = { repositoryId, pullNumber: value.number };
         result = await processPull({ ...base, kind: 'automatic', pullNumber: value.number, label: value.label?.name ?? null });
       } else if (event === 'issue_comment') {
         const value = z.object({ action: z.string(), issue: z.object({ number, pull_request: z.object({}).optional() }),
           comment: z.object({ id, body: z.string(), user: actorSchema }) }).parse(raw);
+        if (value.issue.pull_request) receiptTarget = { repositoryId, pullNumber: value.issue.number };
         if (value.action !== 'created' || !value.issue.pull_request || value.comment.body.trim() !== '/claude-review rerun' || value.comment.user.type !== 'User') result = ignored('not_a_rerun_command');
         else result = await processPull({ ...base, actor: value.comment.user, kind: 'rerun', pullNumber: value.issue.number, commandKey: `comment:${repositoryId}:${value.comment.id}` });
       } else if (event === 'check_run') {
         const value = z.object({ action: z.string(), check_run: z.object({ id, app: z.object({ id }), pull_requests: z.array(z.object({ number })) }) }).parse(raw);
         const target = value.check_run.pull_requests[0];
+        if (target && value.check_run.pull_requests.length === 1) receiptTarget = { repositoryId, pullNumber: target.number };
         if (value.action !== 'rerequested' || value.check_run.app.id !== options.appId || value.check_run.pull_requests.length !== 1 || !target) result = ignored('unrelated_check_run');
         else result = await processPull({ ...base, kind: 'rerun', pullNumber: target.number, checkRunId: value.check_run.id });
       } else if (event === 'push') {
@@ -202,7 +210,7 @@ export function createAdmissionService(options: {
       } else result = ignored('unsubscribed_event');
     }
     // The caller may now send HTTP acknowledgement. There is no inference call in this path.
-    store.acknowledge(deliveryId, result);
+    store.acknowledge(deliveryId, result, receiptTarget);
     return result;
   }
 

@@ -9,6 +9,7 @@ export interface AdmissionGitHubPort {
   assertInstallation(installationId: string): Promise<{ ownerId: string }>;
   listInstallations(): Promise<string[]>;
   readLivePull(installationId: string, repositoryId: string, pullNumber: number): Promise<LivePull>;
+  readDefaultBranch(installationId: string, repositoryId: string): Promise<string | null>;
   readFile(pull: LivePull, path: string): Promise<string | null>;
   readPermission(pull: LivePull, login: string): Promise<string>;
   readCheckRun(pull: LivePull, id: string): Promise<{ appId: string; headSha: string; pullNumbers: number[] }>;
@@ -37,9 +38,9 @@ const numericId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER).trans
 const apiId = z.union([numericId, z.string().regex(/^[1-9][0-9]*$/)]);
 const sha = z.string().regex(/^[0-9a-f]{40}$/);
 const user = z.object({ login: z.string().min(1), type: z.enum(['User', 'Bot', 'Mannequin']) });
-const repository = z.object({ id: apiId, name: z.string().min(1), owner: z.object({ id: apiId, login: z.string().min(1) }) });
+const repository = z.object({ default_branch: z.string().min(1).nullable().optional(), id: apiId, name: z.string().min(1), owner: z.object({ id: apiId, login: z.string().min(1) }) });
 const apiPull = z.object({
-  number: z.number().int().positive(), state: z.enum(['open', 'closed']), draft: z.boolean(), user,
+  number: z.number().int().positive(), state: z.enum(['open', 'closed']), closed_at: z.string().datetime().nullable().optional(), draft: z.boolean(), user,
   labels: z.array(z.object({ name: z.string() })),
   head: z.object({ sha, repo: z.object({ id: apiId }).nullable() }),
   base: z.object({ sha, ref: z.string().min(1), repo: z.object({ id: apiId }) }),
@@ -76,7 +77,7 @@ export function createGitHubAdapter(options: {
   appId: string; privateKey: string; ownerIds: string[];
   fetch?: typeof fetch;
 }): GitHubPort & GitCredentialPort {
-  const settings = { authStrategy: createAppAuth, request: { fetch: options.fetch ?? fetch } };
+  const settings = { authStrategy: createAppAuth, request: { fetch: options.fetch ?? fetch, timeout: 30000 } };
   const app = new Octokit({ ...settings, auth: { appId: options.appId, privateKey: options.privateKey } });
   const installations = new Map<string, Octokit>();
   const owners = new Set(options.ownerIds);
@@ -151,7 +152,7 @@ export function createGitHubAdapter(options: {
     try {
       const auth = z.object({ token: z.string().min(1) }).parse(await client(target.installationId).auth({ type: 'installation',
         repositoryIds: [Number(target.repositoryId)], permissions: { [permission]: 'write' } }));
-      const scoped = new Octokit({ auth: auth.token, request: { fetch: options.fetch ?? fetch } });
+      const scoped = new Octokit({ auth: auth.token, request: { fetch: options.fetch ?? fetch, timeout: 30000 } });
       return (await scoped.request(route, route === 'POST /graphql' ? parameters : { owner: target.owner, repo: target.repo, ...parameters })).data;
     } catch (error) {
       if (error && typeof error === 'object' && 'status' in error && Number(error.status) === 403 && !rateLimited(error)) throw new GitHubPermissionError();
@@ -169,6 +170,10 @@ export function createGitHubAdapter(options: {
   }
   return {
     assertInstallation,
+    async readDefaultBranch(installationId, repositoryId) {
+      await assertInstallation(installationId);
+      return (await readRepository(installationId, repositoryId)).default_branch ?? null;
+    },
     async listOwnedPublications(target) {
       const author = await authorId(target), args = { owner: target.owner, repo: target.repo };
       const result: OwnedPublication[] = [];
@@ -263,6 +268,7 @@ export function createGitHubAdapter(options: {
         pullNumber, headRepositoryId: pull.head.repo?.id ?? null, baseRepositoryId: pull.base.repo.id,
         headSha: pull.head.sha, baseRef: pull.base.ref, baseSha: pull.base.sha,
         mergeBaseSha: comparison.merge_base_commit.sha, draft: pull.draft, state: pull.state,
+        closedAt: pull.closed_at ? Date.parse(pull.closed_at) : null,
         labels: pull.labels.map((label) => label.name), author: pull.user });
     },
     async readFile(pull, path) {

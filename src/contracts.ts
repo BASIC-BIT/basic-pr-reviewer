@@ -29,7 +29,7 @@ export const livePullSchema = z.strictObject({
   headRepositoryId: githubIdSchema.nullable(), baseRepositoryId: githubIdSchema,
   owner: idSchema, repo: idSchema, pullNumber: sequenceSchema,
   headSha: shaSchema, baseRef: idSchema, baseSha: shaSchema, mergeBaseSha: shaSchema,
-  draft: z.boolean(), state: z.enum(['open', 'closed']), labels: z.array(z.string()),
+  draft: z.boolean(), state: z.enum(['open', 'closed']), closedAt: timestampSchema.nullable().optional(), labels: z.array(z.string()),
   author: z.strictObject({ login: idSchema, type: z.enum(['User', 'Bot', 'Mannequin']) }),
 });
 export type LivePull = z.infer<typeof livePullSchema>;
@@ -294,6 +294,7 @@ export interface Store {
   savePass(identity: ReviewIdentity, spec: PlannedPass | PassSpec, outcome: PassOutcome, owner: LeaseOwnership): void;
   renewLease(identity: ReviewIdentity, owner: LeaseOwnership): Lease;
   recoverExpiredLeases(now: number): void;
+  interruptLeases(now: number): void;
   startPass(identity: ReviewIdentity, passId: string, owner: LeaseOwnership): number;
   passAttempts(identity: ReviewIdentity, passId: string): number;
   settle(identity: ReviewIdentity, owner: LeaseOwnership, settlement: AttemptSettlement): void;
@@ -309,7 +310,7 @@ export interface Store {
   restoreAccess(installationId: string, repositoryId: string, expectedAccessGeneration: number): number;
   setAccess(installationId: string, repositoryId: string | null, allowed: boolean): void;
   receipt(deliveryId: string): WebhookAdmission | null;
-  acknowledge(deliveryId: string, admission: WebhookAdmission): void;
+  acknowledge(deliveryId: string, admission: WebhookAdmission, target?: { repositoryId: string; pullNumber: number }): void;
   planPublication(intent: PublicationIntent, owner: LeaseOwnership): PublicationRecord;
   publications(repositoryId: string, pullNumber: number): PublicationRecord[];
   publicationNotices(repositoryId?: string, pullNumber?: number): PublicationNotice[];
@@ -320,6 +321,9 @@ export interface Store {
   markPublicationSending(key: string): void;
   acknowledgePublication(key: string, remoteId: string): void;
   planPublicationUndo(resolveKey: string): PublicationOperation;
+  observePullState(repositoryId: string, pullNumber: number, state: 'open' | 'closed', now: number): void;
+  purgeClosedBefore(cutoff: number): number;
+  health(): { workerFailures: number; publicationFailures: number };
   backup(path: string): Promise<void>;
   close(): void;
 }

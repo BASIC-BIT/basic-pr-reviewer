@@ -23,6 +23,8 @@ const pull: LivePull = {
 class FakeGitHub implements AdmissionGitHubPort {
   live = structuredClone(pull);
   calls: string[] = [];
+  defaultBranch: string | null = 'main';
+  async readDefaultBranch() { return this.defaultBranch; }
   permission = 'write';
   revoked = false;
   files = new Map([
@@ -150,6 +152,8 @@ describe('signed, durable event admission', () => {
     expect((await send(service, payload('labeled', { label: { name: 'cosmetic' } }))).kind).toBe('ignored');
     github.live.headSha = 'f'.repeat(40);
     await service.reconcilePull('200', 42);
+    expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
+    await send(service, payload('synchronize'));
     expect(store.current('200', 42)?.state).toBe('queued');
   });
   it('honors explicitly enabled rerun-on-unskip', async () => {
@@ -395,7 +399,7 @@ describe('signed, durable event admission', () => {
     github.readLivePull = async () => ({ ...github.live, installationId: '101', repositoryId: '201', headRepositoryId: '201', baseRepositoryId: '201' });
     await service.reconcileInstalled();
     expect(store.current('200', 42)?.state).toBe('superseded');
-    expect(store.current('201', 42)?.state).toBe('queued');
+    expect(store.observation('201', 42).blockedReason).toBe('actor_provenance_unknown');
   });
   it.each(['installation', 'installation_repositories'])('recovers missed %s restoration from live access without reviving the cancelled head', async (event) => {
     const { store, github, service } = setup();
@@ -412,6 +416,8 @@ describe('signed, durable event admission', () => {
     expect(store.claim(Date.now())).toBeNull();
     github.live.headSha = 'f'.repeat(40);
     await service.reconcileInstalled();
+    expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
+    await send(service, payload('synchronize'));
     expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { headSha: 'f'.repeat(40) } });
   });
   it('recovers a delayed removal delivery and admits a later head without another re-add event', async () => {
@@ -484,4 +490,48 @@ describe('signed, durable event admission', () => {
       expect(scans).toBe(8);
     } finally { stop(); vi.useRealTimers(); }
   });
+});
+
+it('rejects a forged feature-base policy before reading its files and follows default branch renames', async () => {
+  const { store, github, service } = setup();
+  github.live.baseRef = 'attacker';
+  github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, baseBranches: ['attacker'], contextMode: 'repo' }));
+  expect(await send(service, payload())).toEqual({ kind: 'cancelled', reason: 'untrusted_base' });
+  expect(github.calls.filter(call => call.startsWith('file:'))).toEqual([]);
+  expect(store.current('200', 42)).toBeNull();
+});
+it('does not infer a missed-head actor is human during reconciliation', async () => {
+  const { store, github, service } = setup();
+  await service.reconcileInstalled();
+  expect(store.current('200', 42)).toBeNull();
+  expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
+  await send(service, payload());
+  const first = store.current('200', 42)!;
+  await service.reconcileInstalled();
+  expect(store.current('200', 42)?.identity).toEqual(first.identity);
+  github.live.headSha = 'f'.repeat(40);
+  await service.reconcileInstalled();
+  expect(store.current('200', 42)?.state).toBe('superseded');
+  expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
+});
+
+it('fails closed with missing repository metadata and accepts a verified default branch rename',async()=>{
+  const {github,service}=setup();github.defaultBranch=null;
+  expect(await send(service,payload())).toEqual({kind:'cancelled',reason:'untrusted_base'});
+  expect(github.calls.filter(call=>call.startsWith('file:'))).toEqual([]);
+  github.defaultBranch='trunk';github.live.baseRef='trunk';
+  github.files.set('.github/claude-review.json',JSON.stringify({...policy,baseBranches:['trunk']}));
+  await send(service,payload('synchronize'));
+  expect(await send(service,{installation:{id:100},repository:{id:200},sender:{login:'human',type:'User'},action:'created',issue:{number:42,pull_request:{}},comment:{id:9898,body:'/claude-review rerun',user:{login:'human',type:'User'}}},'issue_comment')).toMatchObject({kind:'admitted'});
+});
+
+it('retains and purges configuration notices that never admitted an attempt',async()=>{
+  const {github,store,service}=setup();github.files.delete('REVIEW.md');
+  await send(service,payload('opened'),'pull_request','configuration-notice');
+  expect(store.current('200',42)).toBeNull();expect(store.trackedInstallations()).toContain('100');expect(store.trackedPulls('100')).toContainEqual({repositoryId:'200',pullNumber:42});
+  const notice=store.publicationNotices('200',42)[0]!;
+  store.planPublicationOperation({key:'a'.repeat(64),fence:{kind:'notice',noticeId:notice.id},target:notice.target,channel:'summary',body:'synthetic'});
+  github.live.state='closed';await service.reconcileInstalled();
+  store.observePullState('200',42,'open',0);store.observePullState('200',42,'closed',1000);
+  expect(store.purgeClosedBefore(1000)).toBe(1);expect(store.publicationNotices()).toEqual([]);expect(store.publicationOperations('200',42)).toEqual([]);expect(store.receipt('configuration-notice')).toBeNull();
 });

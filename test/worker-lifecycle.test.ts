@@ -75,6 +75,10 @@ it('blocks admission after removal failure, then reaps before admitting again wi
     expect(guard).toHaveBeenCalledOnce();
     expect(credential).toHaveBeenCalledTimes(beforeCredentialCount);
     expect(starts).toBe(2);
+    credential.mockRejectedValueOnce({ credentialFailure: 'configuration', message: 'synthetic-secret-diagnostic' });
+    expect((await worker.runPass(identity, spec, new AbortController().signal)).failureCode).toBe('credential_configuration_failure');
+    credential.mockRejectedValueOnce({ credentialFailure: 'temporary', message: 'synthetic-secret-diagnostic' });
+    expect((await worker.runPass(identity, spec, new AbortController().signal)).failureCode).toBe('credential_transport_failure');
     for (const args of calls.filter(args => args[0] === 'create' || args[0] === 'run' && args.includes('-d'))) {
       expect(args[args.indexOf('--log-driver') + 1]).toBe('none');
     }
@@ -82,7 +86,7 @@ it('blocks admission after removal failure, then reaps before admitting again wi
     const oversized = { ...spec, trustedInstructions: [{ path: 'REVIEW.md', text, hash: createHash('sha256').update(text).digest('hex') }] };
     expect((await worker.runPass(identity, oversized, new AbortController().signal)).failureCode).toBe('request_input_limit');
     expect(calls).toHaveLength(allocationCalls);
-    expect(credential).toHaveBeenCalledTimes(beforeCredentialCount);
+    expect(credential).toHaveBeenCalledTimes(beforeCredentialCount + 2);
     expect(starts).toBe(2);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

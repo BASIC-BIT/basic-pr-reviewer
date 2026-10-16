@@ -45,6 +45,7 @@ function credentialFailure(error: unknown): Error | null {
     'retry-after': z.unknown().optional(), 'x-ratelimit-reset': z.unknown().optional(), 'x-ratelimit-remaining': z.unknown().optional(),
   }).optional() }).safeParse(parsed.data.response);
   const headers = response.success ? response.data.headers : undefined;
+  if (parsed.data.status === 403 && parsed.data.rateLimited !== true && headers?.['x-ratelimit-remaining'] !== '0' && !headers?.['retry-after']) return new SourceError('authentication_failure');
   if (parsed.data.status !== 429 && !(parsed.data.status === 403 && (parsed.data.rateLimited === true || headers?.['x-ratelimit-remaining'] === '0'))) return null;
   function milliseconds(value: unknown): number | null {
     const seconds = z.union([z.number().finite().nonnegative(), z.string().regex(/^\d+(?:\.\d+)?$/)]).safeParse(value);

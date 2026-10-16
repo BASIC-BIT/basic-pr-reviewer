@@ -192,7 +192,7 @@ export function createScheduler(options: SchedulerOptions) {
         else if (outcome.status === 'completed') {
           if (result.status === 'complete') settle('complete', null);
           else settle('queued', 'automatic_recovery');
-        } else if (['authentication_failure', 'credential_unavailable', 'provider_access_denied'].includes(outcome.failureCode)) settle('intervention', outcome.failureCode);
+        } else if (['authentication_failure', 'credential_unavailable', 'credential_configuration_failure', 'provider_access_denied'].includes(outcome.failureCode)) settle('intervention', outcome.failureCode);
         else if (outcome.failureCode === 'turn_limit' || outcome.failureCode === 'timeout') settle('queued', 'scope_exhausted');
         else if (count >= 4) settle('queued', 'pass_retries_exhausted');
         else retry(count, outcome.failureCode);
@@ -243,5 +243,5 @@ export function createScheduler(options: SchedulerOptions) {
     try { await run(claim, controller); }
     finally { active = null; }
   }
-  return { tick, cancelPull, recoverExpiredLeases, recoverWorker, get recoveryRequired() { return blocked || source.recoveryRequired; } };
+  return { stop() { active?.controller.abort(); }, tick, cancelPull, recoverExpiredLeases, recoverWorker, get recoveryRequired() { return blocked || source.recoveryRequired; } };
 }

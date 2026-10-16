@@ -7,6 +7,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { findingSchema, passSpecSchema, reviewIdentitySchema, validatePassOutcome } from './contracts.js';
 import type { PassOutcome, PassSpec, ReviewIdentity } from './contracts.js';
+import { assertVerifiedRelease } from './release.js';
+import type { VerifiedRelease } from './release.js';
 import { navigationAlias, passContextHash, renderNavigation } from './source.js';
 
 export const profile = Object.freeze({ cliVersion: '2.1.301', model: 'claude-opus-5-5', node: '24.22.0',
@@ -28,10 +30,10 @@ export function cliArguments(): string[] {
     '--max-turns', String(profile.maxTurns), '--add-dir', '/bundle', '--system-prompt-file', '/worker/review-prompt.md'];
 }
 
-export function workerRuntimeHash(workerImage: string, proxyImage: string): string {
+export function workerRuntimeHash(workerImage: string, proxyImage: string, coreHash?: string): string {
   const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
   const hash = createHash('sha256').update(readFileSync(new URL(import.meta.url))).update(JSON.stringify({ profile, args: cliArguments(),
-    sandbox: sandboxArguments(), workerImage: digest.parse(workerImage), proxyImage: digest.parse(proxyImage) }));
+    sandbox: sandboxArguments(), coreHash: coreHash ?? null, workerImage: digest.parse(workerImage), proxyImage: digest.parse(proxyImage) }));
   for (const name of ['Dockerfile', 'bootstrap.mjs', 'proxy.Dockerfile', 'proxy-entrypoint.sh', 'squid.conf', 'managed-settings.json', 'settings.json', 'mcp.json', 'review-prompt.md']) {
     hash.update(name).update(readFileSync(new URL(`../worker/${name}`, import.meta.url)));
   }
@@ -87,11 +89,15 @@ export async function passPrompt(spec: PassSpec): Promise<string> {
   return prompt;
 }
 
-export async function createWorker(options: { workerImage: string; proxyImage: string; temporaryRoot: string; oauthToken: () => Promise<string> }) {
+export async function createWorker(options: { workerImage: string; proxyImage: string; temporaryRoot: string; oauthToken: () => Promise<string>; release?: VerifiedRelease }) {
   if (process.platform === 'linux' && process.getuid?.() !== 1000) throw new Error('supervisor_uid_mismatch');
   const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
   const workerImage = digest.parse(options.workerImage), proxyImage = digest.parse(options.proxyImage);
-  const root = await realpath(options.temporaryRoot), runtimeHash = workerRuntimeHash(workerImage, proxyImage);
+  if (options.release) {
+    assertVerifiedRelease(options.release);
+    if (options.release.workerImage !== workerImage || options.release.proxyImage !== proxyImage) throw new Error('release_image_mismatch');
+  }
+  const root = await realpath(options.temporaryRoot), runtimeHash = workerRuntimeHash(workerImage, proxyImage, options.release?.coreHash);
   const hostEnv: NodeJS.ProcessEnv = {};
   for (const name of ['PATH', 'SystemRoot']) if (process.env[name]) hostEnv[name] = process.env[name];
   const controlSignal = new AbortController().signal;
@@ -164,7 +170,10 @@ export async function createWorker(options: { workerImage: string; proxyImage: s
       await beforeCredential?.();
       signal.throwIfAborted();
       let token: string;
-      try { token = await options.oauthToken(); } catch { throw new WorkerError('credential_unavailable'); }
+      try { token = await options.oauthToken(); } catch (error) {
+        const failure = z.object({ credentialFailure: z.enum(['configuration', 'temporary']) }).safeParse(error);
+        throw new WorkerError(failure.success && failure.data.credentialFailure === 'temporary' ? 'credential_transport_failure' : 'credential_configuration_failure');
+      }
       await beforeCredential?.();
       if (!/^[\x21-\x7e]{1,8192}$/.test(token)) throw new WorkerError('credential_unavailable');
       signal.throwIfAborted();
