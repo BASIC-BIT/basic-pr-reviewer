@@ -241,10 +241,16 @@ process.stdin.on('end', () => {
         item.disposition = 'excluded'; manifest.exclusions.push({ path: item.path, code: docsOnly ? 'docs_only' : 'policy_exclusion' });
       }
       if (policy.contextMode === 'allowlist') {
-        for (const entry of fields(await git(directory, ['ls-tree', '-rz', '--full-tree', identity.headSha], undefined, signal))) {
-          const tab = entry.indexOf(9), metadata = entry.subarray(0, tab).toString('ascii').match(/^([0-7]{6}) blob ([0-9a-f]{40})$/);
-          const path = pathIdentity(entry.subarray(tab + 1));
-          if (metadata?.[1] && metadata[2] && matches(path, policy.contextAllowGlobs) && !excluded(path, policy.excludeGlobs)) snapshot.context.push({ path, blob: metadata[2], mode: metadata[1] });
+        try {
+          for (const entry of fields(await git(directory, ['ls-tree', '-rz', '--full-tree', identity.headSha], undefined, signal))) {
+            const tab = entry.indexOf(9), metadata = entry.subarray(0, tab).toString('ascii').match(/^([0-7]{6}) blob ([0-9a-f]{40})$/);
+            const path = pathIdentity(entry.subarray(tab + 1));
+            if (metadata?.[1] && metadata[2] && matches(path, policy.contextAllowGlobs) && !excluded(path, policy.excludeGlobs)) snapshot.context.push({ path, blob: metadata[2], mode: metadata[1] });
+          }
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          snapshot.context = [];
+          manifest.retrievalFailures.push({ path: null, code: error instanceof SourceError ? `context_${error.code}` : 'context_retrieval_failed' });
         }
       }
       const ids = new Set<string>();
@@ -282,13 +288,16 @@ process.stdin.on('end', () => {
         else if (item.oldMode === '120000' || item.newMode === '120000') kind = 'symlink';
         else if (old.includes(0) || next.includes(0) || utf8(old) === null || utf8(next) === null) kind = 'binary';
         else if (item.oldBlobId === item.newBlobId && !item.oldPath) kind = 'mode';
-        let patch: Buffer;
+        let patch: Buffer, pendingDiff: { key: string; bytes: Buffer } | null = null;
         if (kind === 'binary' || kind === 'gitlink') patch = Buffer.from(`${kind}: old=${item.oldBlobId ?? 'absent'} new=${item.newBlobId ?? 'absent'}\n`);
         else {
           const key = `${item.oldBlobId ?? emptyBlob}:${item.newBlobId ?? emptyBlob}`;
           let diff = diffs.get(key);
           if (!diff) {
-            try { diff = await git(directory, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=3', item.oldBlobId ?? emptyBlob, item.newBlobId ?? emptyBlob, '--'], undefined, signal); diffs.set(key, diff); }
+            try {
+              diff = await git(directory, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=3', item.oldBlobId ?? emptyBlob, item.newBlobId ?? emptyBlob, '--'], undefined, signal);
+              pendingDiff = { key, bytes: diff };
+            }
             catch (error) {
               if (signal?.aborted) throw error;
               item.disposition = 'retrieval_failure'; manifest.retrievalFailures.push({ path: item.path, code: error instanceof SourceError ? error.code : 'diff_retrieval_failed' }); continue;
@@ -297,10 +306,12 @@ process.stdin.on('end', () => {
           patch = diff.length ? diff : Buffer.from(`${kind}: ${item.oldMode} -> ${item.newMode}\n`);
         }
         const pieces = patchPieces(patch), generatedBytes = pieces.reduce((sum, piece) => sum + piece.bytes.length, 0);
-        if (captured + generatedBytes > limits.maxCaptureBytes) {
+        const retainedBytes = generatedBytes + (pendingDiff?.bytes.length ?? 0);
+        if (captured + retainedBytes > limits.maxCaptureBytes) {
           item.disposition = 'retrieval_failure'; manifest.retrievalFailures.push({ path: item.path, code: 'capture_limit' }); continue;
         }
-        captured += generatedBytes;
+        captured += retainedBytes;
+        if (pendingDiff) diffs.set(pendingDiff.key, pendingDiff.bytes);
         for (const [index, { bytes, oldLines, newLines }] of pieces.entries()) {
           const contentHash = hash(bytes);
           const unit = { sourceId: item.id, path: item.path, oldPath: item.oldPath, oldBlobId: item.oldBlobId, newBlobId: item.newBlobId,

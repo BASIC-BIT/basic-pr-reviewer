@@ -215,6 +215,41 @@ describe('immutable inert Git source', { timeout: 120000 }, () => {
     expect(m.retrievalFailures.length).toBeGreaterThan(0);
     expect(m.sourceMap.filter((item) => item.disposition === 'review').length + m.retrievalFailures.length).toBe(12);
   });
+  it('budgets retained raw diffs and patch pieces across many distinct exhausted blob pairs', async () => {
+    const texts = Array.from({ length: 8 }, (_, index) => `${String.fromCharCode(65 + index).repeat(1500)}\n`);
+    const old: Entry[] = [{ path: '000-small', text: 'old\n' }], changed: Entry[] = [{ path: '000-small', text: 'new\n' }];
+    for (const [left, before] of texts.entries()) for (const [right, after] of texts.entries()) if (left !== right) {
+      const path = `pair-${left}-${right}`;
+      old.push({ path, text: before }); changed.push({ path, text: after });
+    }
+    const maxCaptureBytes = 20000, f = await fixture(old, changed), p = policy(), { source } = await service(f, { maxCaptureBytes });
+    const m = await source.captureManifest(identity(f, p), p);
+    const uniqueBlobBytes = [...texts, 'old\n', 'new\n'].reduce((sum, text) => sum + Buffer.byteLength(text), 0);
+    // Each fixture pair produces one small hunk, so its raw diff and patch piece have equal length.
+    const retainedRawDiffs = new Map(m.units.map((unit) => [`${unit.oldBlobId}:${unit.newBlobId}`, unit.diffBytes]));
+    const retainedBytes = uniqueBlobBytes + m.units.reduce((sum, unit) => sum + unit.diffBytes, 0) + [...retainedRawDiffs.values()].reduce((sum, bytes) => sum + bytes, 0);
+    expect(m.sourceMap).toHaveLength(57);
+    expect(m.units.some((unit) => unit.path.bytesBase64 === Buffer.from('000-small').toString('base64'))).toBe(true);
+    expect(m.retrievalFailures.length).toBeGreaterThan(40);
+    expect(m.sourceMap.filter((item) => item.disposition === 'review').length + m.retrievalFailures.length).toBe(57);
+    expect(retainedBytes).toBeLessThanOrEqual(maxCaptureBytes);
+    expect(m.retrievalFailures.every((failure) => failure.code === 'capture_limit')).toBe(true);
+  });
+  it('preserves changed scope when optional allowlist enumeration exceeds the Git output ceiling', async () => {
+    const neighbors = Array.from({ length: 40 }, (_, index) => ({ path: `neighbors/file-${index}.txt`, text: 'unchanged\n' }));
+    const f = await fixture(neighbors, [...neighbors, { path: 'changed', text: 'review this\n' }]);
+    const limits = { maxGitOutputBytes: 1024 }, p = policy({ contextMode: 'allowlist', contextAllowGlobs: ['neighbors/**'] }), { source, root } = await service(f, limits);
+    const m = await source.captureManifest(identity(f, p), p);
+    expect(m.sourceMap).toHaveLength(1);
+    expect(m.sourceMap[0]?.disposition).toBe('review');
+    expect(m.units).toHaveLength(1);
+    expect(m.retrievalFailures).toEqual([{ path: null, code: 'context_git_output_limit' }]);
+    const b = await source.materializeBundle(m, m.units.map((unit) => unit.id));
+    expect(b.omissions).toContainEqual({ path: null, code: 'context_git_output_limit' });
+    expect(b.sourceMap.every((entry) => entry.path.bytesBase64 === Buffer.from('changed').toString('base64'))).toBe(true);
+    await source.destroyWorkspace(b.directory); await source.destroyWorkspace(m.workspace);
+    expect(await readdir(root)).toEqual([]);
+  });
   it('retains selected unit and readable-context hashes across unrelated heads and attempts', async () => {
     const f = await fixture([], [{ path: 'selected', text: 'same selected change\n' }]), p = policy({ excludeGlobs: ['excluded/**'] }), { source } = await service(f);
     const first = await source.captureManifest(identity(f, p), p);
