@@ -2,6 +2,7 @@ CREATE TABLE pulls (
   repository_id TEXT NOT NULL,
   pull_number INTEGER NOT NULL CHECK (pull_number > 0),
   generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  rerun_sequence INTEGER NOT NULL DEFAULT 0 CHECK (rerun_sequence >= 0),
   current_attempt_id INTEGER REFERENCES attempts(id),
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (repository_id, pull_number)
@@ -12,7 +13,7 @@ CREATE TABLE attempts (
   repository_id TEXT NOT NULL,
   pull_number INTEGER NOT NULL,
   generation INTEGER NOT NULL CHECK (generation > 0),
-  work_key TEXT NOT NULL UNIQUE,
+  work_key TEXT NOT NULL,
   identity_json TEXT NOT NULL CHECK (json_valid(identity_json)),
   state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'superseded')),
   created_at INTEGER NOT NULL,

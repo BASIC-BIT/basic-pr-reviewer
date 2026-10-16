@@ -11,6 +11,12 @@ import type {
 } from './contracts.js';
 
 export const LEASE_DURATION_MS = 60 * 60 * 1_000;
+export class StaleAdmissionObservationError extends Error {
+  constructor() {
+    super('Stale admission observation; read current generation and live identity again');
+    this.name = 'StaleAdmissionObservationError';
+  }
+}
 const attemptRowSchema = z.object({
   identity_json: z.string(), state: attemptStateSchema,
   created_at: timestampSchema, updated_at: timestampSchema,
@@ -111,21 +117,26 @@ export function openStore(path: string): Store {
           const { attempt_id: id } = z.object({ attempt_id: z.number().int().positive() }).parse(replay);
           return { kind: 'duplicate', ...attempt(String(id)) };
         }
-        const workKey = createHash('sha256').update(JSON.stringify({ identity: event.identity, trigger: event.trigger })).digest('hex');
-        const existing = db.prepare('SELECT * FROM attempts WHERE work_key = ?').get(workKey);
+        const { repositoryId, pullNumber } = event.identity;
+        const workKey = createHash('sha256').update(JSON.stringify(event.identity)).digest('hex');
+        const row = db.prepare('SELECT a.*, p.rerun_sequence FROM pulls p JOIN attempts a ON p.current_attempt_id = a.id WHERE p.repository_id = ? AND p.pull_number = ?')
+          .get(repositoryId, pullNumber);
+        const current = row ? readAttempt(row) : null;
+        const snapshot = row ? z.object({ work_key: z.string(), rerun_sequence: timestampSchema }).parse(row) : null;
+        const rerunSequence = snapshot?.rerun_sequence ?? 0;
+        const duplicate = event.trigger.kind === 'automatic'
+          ? snapshot?.work_key === workKey : event.trigger.sequence <= rerunSequence;
         let admitted: AttemptRecord;
         let kind: 'created' | 'duplicate';
-        if (existing) {
-          admitted = readAttempt(existing);
+        if (current && duplicate) {
+          admitted = current;
           kind = 'duplicate';
         } else {
-          const { repositoryId, pullNumber } = event.identity;
+          if (event.expectedGeneration !== (current?.identity.generation ?? 0)) throw new StaleAdmissionObservationError();
           const now = Date.now();
           db.prepare('INSERT INTO pulls (repository_id, pull_number, updated_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING')
             .run(repositoryId, pullNumber, now);
-          const prior = z.object({ generation: z.number().int().nonnegative() }).parse(
-            db.prepare('SELECT generation FROM pulls WHERE repository_id = ? AND pull_number = ?').get(repositoryId, pullNumber));
-          const generation = prior.generation + 1;
+          const generation = (current?.identity.generation ?? 0) + 1;
           db.prepare("UPDATE attempts SET state = 'superseded', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE repository_id = ? AND pull_number = ? AND state != 'superseded'")
             .run(now, repositoryId, pullNumber);
           db.prepare("UPDATE publications SET state = 'superseded', updated_at = ? WHERE attempt_id IN (SELECT id FROM attempts WHERE repository_id = ? AND pull_number = ?) AND state = 'planned'")
@@ -135,8 +146,8 @@ export function openStore(path: string): Store {
           const id = String(inserted.lastInsertRowid);
           const identity = reviewIdentitySchema.parse({ ...event.identity, attemptId: id, generation });
           db.prepare('UPDATE attempts SET identity_json = ? WHERE id = ?').run(JSON.stringify(identity), id);
-          db.prepare('UPDATE pulls SET generation = ?, current_attempt_id = ?, updated_at = ? WHERE repository_id = ? AND pull_number = ?')
-            .run(generation, id, now, repositoryId, pullNumber);
+          db.prepare('UPDATE pulls SET generation = ?, current_attempt_id = ?, updated_at = ?, rerun_sequence = ? WHERE repository_id = ? AND pull_number = ?')
+            .run(generation, id, now, event.trigger.kind === 'rerun' ? event.trigger.sequence : rerunSequence, repositoryId, pullNumber);
           admitted = attempt(id);
           kind = 'created';
         }
@@ -180,12 +191,13 @@ export function openStore(path: string): Store {
       });
     },
     current(repositoryId, pullNumber) {
-      const row = db.prepare('SELECT a.* FROM attempts a JOIN pulls p ON p.current_attempt_id = a.id WHERE p.repository_id = ? AND p.pull_number = ?')
+      const row = db.prepare('SELECT a.*, p.rerun_sequence FROM attempts a JOIN pulls p ON p.current_attempt_id = a.id WHERE p.repository_id = ? AND p.pull_number = ?')
         .get(repositoryId, pullNumber);
       if (!row) return null;
       const record = readAttempt(row);
       const passes = db.prepare('SELECT * FROM passes WHERE attempt_id = ? ORDER BY id').all(record.identity.attemptId).map(readPass);
-      return { ...record, passes };
+      const { rerun_sequence: rerunSequence } = z.object({ rerun_sequence: timestampSchema }).parse(row);
+      return { ...record, rerunSequence, passes };
     },
     planPublication(input) {
       const intent = publicationIntentSchema.parse(input);

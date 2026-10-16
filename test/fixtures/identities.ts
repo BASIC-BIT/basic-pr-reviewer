@@ -4,6 +4,7 @@ export const event: AdmittedEvent = {
   schemaVersion: 1,
   deliveryId: 'delivery-1',
   receivedAt: 1_000,
+  expectedGeneration: 0,
   trigger: { kind: 'automatic' },
   identity: {
     installationId: '100', repositoryId: '200', owner: 'example', repo: 'fixture',

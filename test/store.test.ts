@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { openStore, LEASE_DURATION_MS } from '../src/store.js';
+import { openStore, LEASE_DURATION_MS, StaleAdmissionObservationError } from '../src/store.js';
 import type { PublicationIntent, Store } from '../src/contracts.js';
 import { event, outcome, spec } from './fixtures/identities.js';
 
@@ -41,12 +41,13 @@ describe('persistent review ledger', () => {
   it('increments generation for an explicit rerun and deduplicates its sequence', () => {
     const store = open();
     const first = store.admit(event);
-    const rerun = store.admit({ ...event, deliveryId: 'rerun-1', trigger: { kind: 'rerun', sequence: 1 } });
+    const rerun = store.admit({ ...event, deliveryId: 'rerun-1', expectedGeneration: first.identity.generation, trigger: { kind: 'rerun', sequence: 1 } });
     expect(rerun.identity.generation).toBe(first.identity.generation + 1);
     expect(rerun.identity.attemptId).not.toBe(first.identity.attemptId);
     expect(store.admit({ ...event, deliveryId: 'rerun-replay', trigger: { kind: 'rerun', sequence: 1 } }))
       .toMatchObject({ kind: 'duplicate', identity: rerun.identity });
-    expect(store.admit({ ...event, deliveryId: 'late-automatic' }).identity).toEqual(first.identity);
+    expect(store.admit({ ...event, deliveryId: 'late-automatic' }).identity).toEqual(rerun.identity);
+    expect(store.admit({ ...event, deliveryId: 'fresh-automatic', expectedGeneration: rerun.identity.generation }).identity).toEqual(rerun.identity);
     expect(store.current('200', 42)?.identity).toEqual(rerun.identity);
     expect(store.claim(2_000)?.identity).toEqual(rerun.identity);
   });
@@ -54,12 +55,66 @@ describe('persistent review ledger', () => {
   it('fences stale generations and mismatched identities from current coverage', () => {
     const store = open();
     const first = store.admit(event);
-    const second = store.admit({ ...event, deliveryId: 'new-head', identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    const second = store.admit({ ...event, deliveryId: 'new-head', expectedGeneration: first.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
     expect(() => store.savePass(first.identity, spec, outcome)).toThrow(/stale/i);
     expect(() => store.savePass({ ...second.identity, baseSha: 'a'.repeat(40) }, spec, outcome)).toThrow(/identity/i);
     expect(store.current('200', 42)?.passes).toEqual([]);
     store.savePass(second.identity, spec, outcome);
     expect(store.current('200', 42)?.passes).toHaveLength(1);
+  });
+
+  it('creates a new current generation when a freshly observed head returns from A to B to A', () => {
+    const store = open();
+    const first = store.admit(event);
+    const second = store.admit({ ...event, deliveryId: 'head-b', expectedGeneration: first.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    const returned = store.admit({ ...event, deliveryId: 'head-a-again', expectedGeneration: second.identity.generation });
+    expect(returned.kind).toBe('created');
+    expect(returned.identity.generation).toBe(second.identity.generation + 1);
+    expect(returned.identity.attemptId).not.toBe(first.identity.attemptId);
+    expect(store.current('200', 42)?.identity).toEqual(returned.identity);
+    expect(() => store.savePass(second.identity, spec, outcome)).toThrow(/stale/i);
+    expect(store.claim(2_000)?.identity).toEqual(returned.identity);
+  });
+
+  it('rejects a stale observation before admitting a fresh transition and permits a new live read', () => {
+    const firstStore = open();
+    const secondStore = open();
+    const first = firstStore.admit(event);
+    const observedGeneration = first.identity.generation;
+    const second = secondStore.admit({ ...event, deliveryId: 'head-b', expectedGeneration: observedGeneration, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    expect(() => firstStore.admit({ ...event, deliveryId: 'delayed-a', expectedGeneration: observedGeneration })).toThrow(StaleAdmissionObservationError);
+    expect(firstStore.current('200', 42)?.identity).toEqual(second.identity);
+    const refreshed = firstStore.admit({ ...event, deliveryId: 'delayed-a', expectedGeneration: second.identity.generation });
+    expect(refreshed.identity.generation).toBe(second.identity.generation + 1);
+  });
+
+  it('replays a known old delivery without restoring its superseded generation', () => {
+    const store = open();
+    const first = store.admit(event);
+    const second = store.admit({ ...event, deliveryId: 'head-b', expectedGeneration: first.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    expect(store.admit(event)).toMatchObject({ kind: 'duplicate', identity: first.identity, state: 'superseded' });
+    expect(store.current('200', 42)?.identity).toEqual(second.identity);
+    expect(store.claim(2_000)?.identity).toEqual(second.identity);
+  });
+
+  it('persists a PR-wide rerun high-water mark and ignores repeated or unseen lower sequences', () => {
+    const store = open();
+    const first = store.admit(event);
+    const rerun = store.admit({ ...event, deliveryId: 'rerun-3', expectedGeneration: first.identity.generation, trigger: { kind: 'rerun', sequence: 3 } });
+    store.close();
+    const reopened = open();
+    expect(reopened.current('200', 42)?.rerunSequence).toBe(3);
+    expect(reopened.admit({ ...event, deliveryId: 'rerun-2-late', expectedGeneration: rerun.identity.generation, trigger: { kind: 'rerun', sequence: 2 } }))
+      .toMatchObject({ kind: 'duplicate', identity: rerun.identity });
+    const second = reopened.admit({ ...event, deliveryId: 'head-b', expectedGeneration: rerun.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    expect(reopened.admit({ ...event, deliveryId: 'rerun-3-late', trigger: { kind: 'rerun', sequence: 3 } }))
+      .toMatchObject({ kind: 'duplicate', identity: second.identity });
+    expect(reopened.current('200', 42)).toMatchObject({ identity: second.identity, rerunSequence: 3 });
+    expect(() => reopened.admit({ ...event, deliveryId: 'rerun-4', trigger: { kind: 'rerun', sequence: 4 } }))
+      .toThrow(StaleAdmissionObservationError);
+    const next = reopened.admit({ ...event, deliveryId: 'rerun-4', expectedGeneration: second.identity.generation, identity: { ...event.identity, headSha: 'f'.repeat(40) }, trigger: { kind: 'rerun', sequence: 4 } });
+    expect(next.identity.generation).toBe(second.identity.generation + 1);
+    expect(reopened.current('200', 42)?.rerunSequence).toBe(4);
   });
 
   it('retains saved pass JSON and delivery deduplication across a close and reopen', () => {
@@ -110,7 +165,7 @@ describe('persistent review ledger', () => {
     const reopened = open();
     expect(reopened.planPublication(intent)).toEqual(planned);
     expect(() => reopened.planPublication({ ...intent, body: 'Different summary.' })).toThrow(/publication/i);
-    reopened.admit({ ...event, deliveryId: 'rerun', trigger: { kind: 'rerun', sequence: 1 } });
+    reopened.admit({ ...event, deliveryId: 'rerun', expectedGeneration: first.identity.generation, trigger: { kind: 'rerun', sequence: 1 } });
     expect(() => reopened.planPublication({ ...intent, key: 'stale-summary' })).toThrow(/stale/i);
   });
 
@@ -139,6 +194,7 @@ describe('persistent review ledger', () => {
     const store = open();
     // @ts-expect-error Runtime input must still reject versions unknown to TypeScript callers.
     expect(() => store.admit({ ...event, schemaVersion: 2 })).toThrow();
+    expect(() => store.admit({ ...event, expectedGeneration: -1 })).toThrow();
     for (const field of ['headSha', 'baseSha', 'mergeBaseSha']) {
       expect(() => store.admit({ ...event, identity: { ...event.identity, [field]: 'bad-sha' } })).toThrow();
     }
@@ -168,6 +224,6 @@ describe('persistent review ledger', () => {
       ...outcome, passId: "pass'); DROP TABLE pulls; --",
     });
     expect(store.current('200', 42)?.passes).toHaveLength(1);
-    expect(store.admit({ ...event, deliveryId: 'still-works' }).kind).toBe('created');
+    expect(store.admit({ ...event, deliveryId: 'still-works', expectedGeneration: admitted.identity.generation }).kind).toBe('created');
   });
 });

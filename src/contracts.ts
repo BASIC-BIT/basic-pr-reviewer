@@ -30,6 +30,8 @@ export const admittedEventSchema = z.strictObject({
   schemaVersion: z.literal(1),
   deliveryId: idSchema,
   receivedAt: timestampSchema,
+  // Read before resolving live identity; a fresh transition must still match this observation.
+  expectedGeneration: timestampSchema,
   identity: reviewInputSchema,
   trigger: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('automatic') }),
@@ -118,7 +120,7 @@ export type PassRecord = {
   createdAt: number;
   updatedAt: number;
 };
-export type PullRecord = AttemptRecord & { passes: PassRecord[] };
+export type PullRecord = AttemptRecord & { rerunSequence: number; passes: PassRecord[] };
 export type PublicationRecord = {
   id: string;
   intent: PublicationIntent;
