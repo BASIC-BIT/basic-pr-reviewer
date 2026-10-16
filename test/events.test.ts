@@ -1,0 +1,399 @@
+import { createHmac } from 'node:crypto';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createAdmissionService } from '../src/events.js';
+import { loadPolicy } from '../src/policy.js';
+import { openStore } from '../src/store.js';
+import { GitHubAccessError } from '../src/github.js';
+import type { GitHubPort } from '../src/github.js';
+import type { LivePull, RepoPolicy, Store } from '../src/contracts.js';
+
+const secret = 'synthetic-webhook-secret';
+const policy: RepoPolicy = {
+  schemaVersion: 1, enabled: true, baseBranches: ['main'], skipLabels: ['skip-review'],
+  rerunOnUnskip: false, excludeGlobs: [], excludeDocsOnly: false, allowBotAuthors: false,
+  allowedBotActors: [], contextMode: 'diff', contextAllowGlobs: [], githubLinksOnly: true,
+  instructionPaths: ['AGENTS.md'],
+};
+const pull: LivePull = {
+  installationId: '100', repositoryId: '200', ownerId: '400', headRepositoryId: '200', baseRepositoryId: '200',
+  owner: 'example', repo: 'fixture', pullNumber: 42, headSha: 'a'.repeat(40),
+  baseRef: 'main', baseSha: 'b'.repeat(40), mergeBaseSha: 'c'.repeat(40),
+  draft: false, state: 'open', labels: [], author: { login: 'author', type: 'User' },
+};
+class FakeGitHub implements GitHubPort {
+  live = structuredClone(pull);
+  calls: string[] = [];
+  permission = 'write';
+  revoked = false;
+  files = new Map([
+    ['.github/claude-review.json', JSON.stringify(policy)], ['REVIEW.md', 'Review this repository.'],
+    ['AGENTS.md', 'Use the repository conventions.'],
+  ]);
+  beforeRead: (() => void) | undefined;
+  async assertInstallation(id: string) {
+    this.calls.push(`access:${id}`);
+    if (this.revoked || id !== '100') throw new Error('Installation access revoked');
+    return { ownerId: '400' };
+  }
+  async listInstallations() { return ['100']; }
+  async readLivePull(installationId: string, repositoryId: string, number: number) {
+    this.calls.push(`pull:${installationId}:${repositoryId}:${number}`);
+    this.beforeRead?.();
+    if (this.revoked) throw new Error('Installation access revoked');
+    return structuredClone(this.live);
+  }
+  async readFile(value: LivePull, path: string) {
+    this.calls.push(`file:${value.baseSha}:${path}`);
+    return this.files.get(path) ?? null;
+  }
+  async readPermission(value: LivePull, login: string) {
+    this.calls.push(`permission:${login}`);
+    return this.permission;
+  }
+  async readCheckRun() { return { appId: '300', headSha: this.live.headSha, pullNumbers: [42] }; }
+  async listRepositories() { return [{ installationId: '100', repositoryId: '200' }]; }
+  async listOpenPulls() { return [42]; }
+}
+const stores: Store[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); });
+function setup() {
+  const store = openStore(':memory:'); stores.push(store);
+  const github = new FakeGitHub();
+  const service = createAdmissionService({ store, github, webhookSecret: secret, appId: '300',
+    ownerIds: ['400'], runtimeHash: 'e'.repeat(64) });
+  return { store, github, service };
+}
+let sequence = 0;
+function payload(action = 'opened', extra = {}) {
+  return { action, installation: { id: 100, account: { id: 400 } }, repository: { id: 200 }, number: 42,
+    sender: { login: 'human', type: 'User' }, pull_request: { number: 42 }, ...extra };
+}
+function signed(value: unknown, event = 'pull_request', delivery = `delivery-${++sequence}`) {
+  const body = Buffer.from(JSON.stringify(value));
+  return { body, headers: { 'x-github-delivery': delivery, 'x-github-event': event,
+    'x-hub-signature-256': `sha256=${createHmac('sha256', secret).update(body).digest('hex')}` } };
+}
+async function send(service: ReturnType<typeof createAdmissionService>, value: unknown, event?: string, delivery?: string) {
+  const input = signed(value, event, delivery);
+  return service.admitWebhook(input.headers, input.body);
+}
+
+describe('signed, durable event admission', () => {
+  it('rejects invalid signatures and oversize bodies before any API call or durable write', async () => {
+    const { store, github, service } = setup();
+    const input = signed(payload());
+    await expect(service.admitWebhook({ ...input.headers, 'x-hub-signature-256': 'sha256=bad' }, input.body)).rejects.toThrow(/signature/i);
+    await expect(service.admitWebhook(input.headers, Buffer.alloc(30 * 1024 * 1024 + 1))).rejects.toThrow(/size/i);
+    expect(github.calls).toEqual([]);
+    expect(store.observation('200', 42).generation).toBe(0);
+    expect(store.receipt(input.headers['x-github-delivery'])).toBeNull();
+  });
+  it.each(['opened', 'ready_for_review', 'synchronize', 'reopened'])('admits current eligible %s and acknowledges durable work', async (action) => {
+    const { store, service } = setup();
+    const result = await send(service, payload(action));
+    expect(result.kind).toBe('admitted');
+    expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { mergeBaseSha: 'c'.repeat(40), generation: 1 } });
+    expect(store.claim(Date.now())).not.toBeNull();
+  });
+  it('acks known replay without fresh API calls, including after restart-equivalent service recreation', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload(), 'pull_request', 'same-delivery');
+    const calls = github.calls.length;
+    expect((await send(service, payload(), 'pull_request', 'same-delivery')).kind).toBe('duplicate');
+    expect(github.calls).toHaveLength(calls);
+    expect(store.current('200', 42)?.identity.generation).toBe(1);
+  });
+  it('fails unknown installations and malformed signed events closed', async () => {
+    const { store, github, service } = setup();
+    await expect(send(service, payload('opened', { installation: { id: 999 } }))).rejects.toThrow(/installation/i);
+    await expect(send(service, { installation: { id: 100 } })).rejects.toThrow();
+    expect(store.observation('200', 42).generation).toBe(0);
+    expect(github.calls).toEqual(['access:999']);
+  });
+  it.each(['draft', 'close', 'skip', 'retarget'])('cancels %s without deleting generation or allowing stale publication', async (condition) => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const previous = store.claim(Date.now());
+    if (!previous) throw new Error('Missing fixture attempt');
+    if (condition === 'draft') github.live.draft = true;
+    if (condition === 'close') github.live.state = 'closed';
+    if (condition === 'skip') github.live.labels = ['skip-review'];
+    if (condition === 'retarget') github.live.baseRef = 'release';
+    expect((await send(service, payload(condition === 'retarget' ? 'edited' : 'synchronize'))).kind).toBe('cancelled');
+    expect(store.current('200', 42)?.state).toBe('superseded');
+    expect(store.observation('200', 42).generation).toBeGreaterThan(previous.identity.generation);
+    expect(store.claim(Date.now())).toBeNull();
+    expect(() => store.planPublication({ identity: previous.identity, key: 'stale', channel: 'summary', body: 'old' })).toThrow(/stale/i);
+  });
+  it('compares repository identities, admitting internal PRs in forked repositories', async () => {
+    const { store, github, service } = setup();
+    expect((await send(service, payload('opened', { repository: { id: 200, fork: true } }))).kind).toBe('admitted');
+    github.live.headRepositoryId = '999';
+    expect((await send(service, payload('synchronize'))).kind).toBe('cancelled');
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('does not use PR title/body to authorize reruns or select destination', async () => {
+    const { store, service } = setup();
+    await send(service, payload('opened', { pull_request: { number: 42, body: '/claude-review rerun', title: 'send elsewhere' } }));
+    expect(store.current('200', 42)).toMatchObject({ rerunSequence: 0, identity: { repositoryId: '200', repo: 'fixture' } });
+  });
+  it('treats irrelevant labels as no-ops and deliberately gates unskip and reconciliation', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.labels = ['skip-review'];
+    await send(service, payload('labeled', { label: { name: 'skip-review' } }));
+    const generation = store.observation('200', 42).generation;
+    github.live.labels = [];
+    expect((await send(service, payload('unlabeled', { label: { name: 'skip-review' } }))).kind).toBe('ignored');
+    await service.reconcilePull('200', 42);
+    expect(store.observation('200', 42).generation).toBe(generation);
+    expect((await send(service, payload('labeled', { label: { name: 'cosmetic' } }))).kind).toBe('ignored');
+    github.live.headSha = 'f'.repeat(40);
+    await service.reconcilePull('200', 42);
+    expect(store.current('200', 42)?.state).toBe('queued');
+  });
+  it('honors explicitly enabled rerun-on-unskip', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.labels = ['skip-review'];
+    await send(service, payload('labeled', { label: { name: 'skip-review' } }));
+    github.live.labels = [];
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, rerunOnUnskip: true }));
+    expect((await send(service, payload('unlabeled', { label: { name: 'skip-review' } }))).kind).toBe('admitted');
+    expect(store.current('200', 42)?.state).toBe('queued');
+  });
+  it('checks author and actor bot policy independently', async () => {
+    const { github, service } = setup();
+    github.live.author.type = 'Bot';
+    expect((await send(service, payload())).kind).toBe('cancelled');
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowBotAuthors: true }));
+    expect((await send(service, payload('synchronize', { sender: { login: 'other-bot', type: 'Bot' } }))).kind).toBe('cancelled');
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowBotAuthors: true, allowedBotActors: ['other-bot'] }));
+    expect((await send(service, payload('synchronize', { sender: { login: 'other-bot', type: 'Bot' } }))).kind).toBe('admitted');
+  });
+  it('requires exact human rerun commands and fresh write permission, deduplicating comment identity', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const comment = (body: string, type = 'User') => payload('created', {
+      issue: { number: 42, pull_request: {} }, comment: { id: 501, body, user: { login: 'operator', type } },
+    });
+    expect((await send(service, comment('please /claude-review rerun'), 'issue_comment')).kind).toBe('ignored');
+    expect((await send(service, comment('/claude-review rerun', 'Bot'), 'issue_comment')).kind).toBe('ignored');
+    github.permission = 'read';
+    expect((await send(service, comment('/claude-review rerun'), 'issue_comment')).kind).toBe('ignored');
+    github.permission = 'maintain';
+    expect((await send(service, comment('/claude-review rerun'), 'issue_comment')).kind).toBe('admitted');
+    const generation = store.observation('200', 42).generation;
+    expect((await send(service, comment('/claude-review rerun'), 'issue_comment')).kind).toBe('duplicate');
+    expect(store.observation('200', 42).generation).toBe(generation);
+    expect(store.current('200', 42)?.rerunSequence).toBe(1);
+    expect(github.calls).toContain('permission:operator');
+  });
+  it('checks authenticated check-run context and current actor permission', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const check = payload('rerequested', { check_run: { id: 700, app: { id: 300 }, pull_requests: [{ number: 42 }] } });
+    github.permission = 'read';
+    expect((await send(service, check, 'check_run')).kind).toBe('ignored');
+    github.permission = 'admin';
+    expect((await send(service, check, 'check_run')).kind).toBe('admitted');
+    expect(store.current('200', 42)?.rerunSequence).toBe(1);
+    expect((await send(service, { ...check, check_run: { id: 700, app: { id: 999 }, pull_requests: [{ number: 42 }] } }, 'check_run')).kind).toBe('ignored');
+  });
+  it('invalidates base-only work without queuing inference, including never-reviewed pulls', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.baseSha = 'd'.repeat(40);
+    expect((await send(service, payload('', { ref: 'refs/heads/main' }), 'push')).kind).toBe('cancelled');
+    expect(store.claim(Date.now())).toBeNull();
+    await service.reconcilePull('200', 42);
+    expect(store.claim(Date.now())).toBeNull();
+    const fresh = setup();
+    await send(fresh.service, payload('', { ref: 'refs/heads/main' }), 'push');
+    await fresh.service.reconcilePull('200', 42);
+    expect(fresh.store.current('200', 42)).toBeNull();
+  });
+  it('loads policy and referenced instructions only at captured base SHA and hashes their content', async () => {
+    const { github } = setup();
+    const first = await loadPolicy(github, pull);
+    expect(first.instructions.map((file) => file.path)).toEqual(['REVIEW.md', 'AGENTS.md']);
+    expect(github.calls.every((call) => call.startsWith(`file:${pull.baseSha}:`))).toBe(true);
+    github.files.set('AGENTS.md', 'Changed trusted instruction.');
+    expect((await loadPolicy(github, pull)).policyHash).not.toBe(first.policyHash);
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, instructionPaths: ['../private.md'] }));
+    await expect(loadPolicy(github, pull)).rejects.toThrow(/policy|instruction/i);
+  });
+  it('records visible missing/invalid policy failures and queues no inference', async () => {
+    const { store, github, service } = setup();
+    github.files.delete('.github/claude-review.json');
+    const result = await send(service, payload(), 'pull_request', 'bad-config');
+    expect(result.kind).toBe('configuration_failure');
+    expect(store.receipt('bad-config')).toMatchObject({ kind: 'configuration_failure' });
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('rereads live identity and policy after stale observation rather than retrying old snapshots', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.beforeRead = () => {
+      github.beforeRead = undefined;
+      const observed = store.observation('200', 42);
+      store.invalidatePull('200', 42, observed.generation, 'base_changed', github.live.headSha, github.live.baseRef);
+      github.live.headSha = 'f'.repeat(40);
+    };
+    await send(service, payload('synchronize'));
+    expect(store.current('200', 42)?.identity.headSha).toBe('f'.repeat(40));
+    expect(github.calls.filter((call) => call.startsWith('pull:'))).toHaveLength(3);
+    expect(github.calls.filter((call) => call.endsWith(':.github/claude-review.json'))).toHaveLength(3);
+  });
+  it.each(['installation', 'installation_repositories'])('cancels pending/running work on %s revocation and fences in-flight admission', async (event) => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    store.claim(Date.now());
+    const revocation = event === 'installation' ? payload('suspend') : payload('removed', { repositories_removed: [{ id: 200 }] });
+    await send(service, revocation, event);
+    expect(store.current('200', 42)?.state).toBe('superseded');
+    github.revoked = true;
+    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access|revoked/i);
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('handles delayed close delivery using fresh live state without cancelling a reopened head', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.headSha = 'f'.repeat(40);
+    await send(service, payload('synchronize'));
+    await send(service, payload('closed'));
+    expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { headSha: 'f'.repeat(40) } });
+  });
+  it('invalidates missed base-only changes during reconciliation instead of starting a new review', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.baseSha = 'd'.repeat(40);
+    await service.reconcilePull('200', 42);
+    expect(store.claim(Date.now())).toBeNull();
+    expect(store.observation('200', 42).blockedReason).toBe('base_changed');
+  });
+  it('does not let reconciliation bypass a rejected bot actor on the same head', async () => {
+    const { store, service } = setup();
+    await send(service, payload('opened', { sender: { login: 'disallowed-bot', type: 'Bot' } }));
+    await service.reconcilePull('200', 42);
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('fences installation revocation during policy reads without admitting its observed identity', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const read = github.readFile.bind(github);
+    github.readFile = async (live, path) => {
+      const value = await read(live, path);
+      if (path === 'AGENTS.md') store.setAccess('100', null, false);
+      return value;
+    };
+    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access revoked/i);
+    expect(store.claim(Date.now())).toBeNull();
+    expect(store.observation('200', 42).generation).toBe(2);
+  });
+  it('cancels prior work when inventory reads discover revoked access', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.listRepositories = async () => { throw new GitHubAccessError('100', null); };
+    await expect(service.reconcilePull('200', 42)).rejects.toThrow(/access revoked/i);
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('reconciles all PR pages at startup and honors rate-limit reset time before the next scan', async () => {
+    vi.useFakeTimers();
+    const { github, service } = setup();
+    let scans = 0;
+    github.listRepositories = async () => {
+      scans++;
+      if (scans === 1) throw { status: 403, response: { headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String((Date.now() + 1_200_000) / 1000) } } };
+      return [{ installationId: '100', repositoryId: '200' }];
+    };
+    const errors: unknown[] = [];
+    const stop = service.startReconciliation((error) => errors.push(error));
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scans).toBe(1);
+      expect(errors).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(900_000);
+      expect(scans).toBe(1);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(scans).toBe(2);
+      expect(github.calls.some((call) => call.startsWith('pull:'))).toBe(true);
+      await vi.advanceTimersByTimeAsync(900_000);
+      expect(scans).toBe(3);
+    } finally { stop(); vi.useRealTimers(); }
+  });
+  it('normalizes a small policy without broadening context access', async () => {
+    const { github } = setup();
+    github.files.set('.github/claude-review.json', JSON.stringify({ schemaVersion: 1, enabled: true }));
+    const trusted = await loadPolicy(github, pull);
+    expect(trusted.policy).toMatchObject({ contextMode: 'changed-context-only', contextAllowGlobs: [],
+      rerunOnUnskip: false, allowBotAuthors: false, githubLinksOnly: false });
+    expect(trusted.instructions.map((file) => file.path)).toEqual(['REVIEW.md']);
+  });
+  it('recovers a missed repository-removal event by cancelling stored work absent from the live inventory', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.listRepositories = async () => [];
+    await service.reconcileInstalled();
+    expect(store.claim(Date.now())).toBeNull();
+    expect(store.accessAllowed('100', '200')).toBe(false);
+  });
+  it('recovers a missed close event for a tracked PR absent from the open list', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.state = 'closed';
+    github.listOpenPulls = async () => [];
+    await service.reconcileInstalled();
+    expect(store.claim(Date.now())).toBeNull();
+    expect(store.observation('200', 42).blockedReason).toBe('closed');
+  });
+  it('processes closure even when trusted policy has become unavailable', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.state = 'closed';
+    github.files.clear();
+    expect(await send(service, payload('closed'))).toEqual({ kind: 'cancelled', reason: 'closed' });
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('rejects a valid signed delivery from a live installation with an unapproved owner', async () => {
+    const { github, service, store } = setup();
+    github.assertInstallation = async () => { github.calls.push('verified-access'); return { ownerId: '999' }; };
+    github.readLivePull = async (installationId) => ({ ...github.live, installationId });
+    await expect(send(service, payload('opened', { installation: { id: 999 } }))).rejects.toThrow(/unapproved installation owner/i);
+    expect(github.calls).toEqual(['verified-access']);
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('checks immutable live owner IDs independently of webhook text', async () => {
+    const { store, github, service } = setup();
+    github.live.ownerId = '999';
+    await expect(send(service, payload('opened', { repository: { id: 200, owner: { id: 400 } } }))).rejects.toThrow(GitHubAccessError);
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('onboards another selected repository under an approved owner using its own local policy', async () => {
+    const { store, github, service } = setup();
+    github.live = { ...github.live, repositoryId: '201', headRepositoryId: '201', baseRepositoryId: '201', repo: 'another' };
+    expect((await send(service, payload('opened', { repository: { id: 201 } }))).kind).toBe('admitted');
+    expect(store.current('201', 42)?.identity.repo).toBe('another');
+  });
+  it('admits a newly verified installation under an approved owner without manual installation enrollment', async () => {
+    const { store, github, service } = setup();
+    github.assertInstallation = async () => ({ ownerId: '400' });
+    github.readLivePull = async (installationId) => ({ ...github.live, installationId });
+    expect((await send(service, payload('opened', { installation: { id: 999 } }))).kind).toBe('admitted');
+    expect(store.current('200', 42)?.identity.installationId).toBe('999');
+  });
+  it('continues reconciling independent installations after cancelling a revoked installation', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.listInstallations = async () => ['101'];
+    github.listRepositories = async (installationId?: string) => {
+      if (installationId === '100') throw new GitHubAccessError('100', null);
+      return [{ installationId: '101', repositoryId: '201' }];
+    };
+    github.assertInstallation = async () => ({ ownerId: '400' });
+    github.readLivePull = async () => ({ ...github.live, installationId: '101', repositoryId: '201', headRepositoryId: '201', baseRepositoryId: '201' });
+    await service.reconcileInstalled();
+    expect(store.current('200', 42)?.state).toBe('superseded');
+    expect(store.current('201', 42)?.state).toBe('queued');
+  });
+});

@@ -5,9 +5,11 @@ import { z } from 'zod';
 import {
   admittedEventSchema, attemptStateSchema, passOutcomeSchema, passSpecSchema,
   publicationIntentSchema, reviewIdentitySchema, timestampSchema,
+  webhookAdmissionSchema,
 } from './contracts.js';
 import type {
   AttemptRecord, PassRecord, PublicationRecord, ReviewIdentity, Store,
+  PullObservation,
 } from './contracts.js';
 
 export const LEASE_DURATION_MS = 60 * 60 * 1_000;
@@ -67,13 +69,13 @@ export function openStore(path: string): Store {
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     const { user_version: version } = z.object({ user_version: z.number().int() })
       .parse(db.prepare('PRAGMA user_version').get());
-    if (version !== 0 && version !== 1) throw new Error(`Unsupported schema version ${version}`);
+    if (version !== 0 && version !== 2) throw new Error(`Unsupported schema version ${version}`);
     db.exec('PRAGMA journal_mode = WAL');
     if (version === 0) {
       transaction(() => {
         const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
         if (current.user_version === 0) db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
-        else if (current.user_version !== 1) throw new Error(`Unsupported schema version ${current.user_version}`);
+        else if (current.user_version !== 2) throw new Error(`Unsupported schema version ${current.user_version}`);
       });
     }
   } catch (error) {
@@ -108,6 +110,36 @@ export function openStore(path: string): Store {
     }
   }
 
+  function observation(repositoryId: string, pullNumber: number): PullObservation {
+    const value = db.prepare('SELECT * FROM pulls WHERE repository_id = ? AND pull_number = ?').get(repositoryId, pullNumber);
+    if (!value) return { generation: 0, rerunSequence: 0, blockedReason: null, observedHeadSha: null, observedBaseRef: null };
+    const row = z.object({ generation: timestampSchema, rerun_sequence: timestampSchema,
+      blocked_reason: z.string().nullable(), observed_head_sha: z.string().nullable(), observed_base_ref: z.string().nullable() }).parse(value);
+    return { generation: row.generation, rerunSequence: row.rerun_sequence, blockedReason: row.blocked_reason,
+      observedHeadSha: row.observed_head_sha, observedBaseRef: row.observed_base_ref };
+  }
+  function accessGeneration(): number {
+    return z.object({ generation: timestampSchema }).parse(db.prepare('SELECT generation FROM access_clock WHERE id = 1').get()).generation;
+  }
+  function accessAllowed(installationId: string, repositoryId: string): boolean {
+    return !db.prepare('SELECT 1 FROM access_rules WHERE installation_id = ? AND repository_id IN (?, ?) AND allowed = 0')
+      .get(installationId, repositoryId, '*');
+  }
+  function invalidatePull(repositoryId: string, pullNumber: number, expectedGeneration: number,
+    reason: string, headSha: string | null, baseRef: string | null): void {
+    const observed = observation(repositoryId, pullNumber);
+    if (observed.generation !== expectedGeneration) throw new StaleAdmissionObservationError();
+    const now = Date.now();
+    db.prepare(`INSERT INTO pulls (repository_id, pull_number, generation, blocked_reason, observed_head_sha, observed_base_ref, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(repository_id, pull_number) DO UPDATE SET generation = excluded.generation,
+      blocked_reason = excluded.blocked_reason, observed_head_sha = excluded.observed_head_sha, observed_base_ref = excluded.observed_base_ref, updated_at = excluded.updated_at`)
+      .run(repositoryId, pullNumber, observed.generation + 1, reason, headSha, baseRef, now);
+    db.prepare("UPDATE attempts SET state = 'superseded', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE repository_id = ? AND pull_number = ? AND state != 'superseded'")
+      .run(now, repositoryId, pullNumber);
+    db.prepare("UPDATE publications SET state = 'superseded', updated_at = ? WHERE attempt_id IN (SELECT id FROM attempts WHERE repository_id = ? AND pull_number = ?) AND state = 'planned'")
+      .run(now, repositoryId, pullNumber);
+  }
+
   return {
     admit(input) {
       const event = admittedEventSchema.parse(input);
@@ -118,6 +150,9 @@ export function openStore(path: string): Store {
           return { kind: 'duplicate', ...attempt(String(id)) };
         }
         const { repositoryId, pullNumber } = event.identity;
+        if (event.expectedAccessGeneration !== undefined && event.expectedAccessGeneration !== accessGeneration()) throw new StaleAdmissionObservationError();
+        if (!accessAllowed(event.identity.installationId, repositoryId)) throw new Error('Installation access revoked');
+        const observed = observation(repositoryId, pullNumber);
         const workKey = createHash('sha256').update(JSON.stringify(event.identity)).digest('hex');
         const row = db.prepare('SELECT a.*, p.rerun_sequence FROM pulls p JOIN attempts a ON p.current_attempt_id = a.id WHERE p.repository_id = ? AND p.pull_number = ?')
           .get(repositoryId, pullNumber);
@@ -125,18 +160,18 @@ export function openStore(path: string): Store {
         const snapshot = row ? z.object({ work_key: z.string(), rerun_sequence: timestampSchema }).parse(row) : null;
         const rerunSequence = snapshot?.rerun_sequence ?? 0;
         const duplicate = event.trigger.kind === 'automatic'
-          ? snapshot?.work_key === workKey : event.trigger.sequence <= rerunSequence;
+          ? current?.state !== 'superseded' && snapshot?.work_key === workKey : event.trigger.sequence <= rerunSequence;
         let admitted: AttemptRecord;
         let kind: 'created' | 'duplicate';
         if (current && duplicate) {
           admitted = current;
           kind = 'duplicate';
         } else {
-          if (event.expectedGeneration !== (current?.identity.generation ?? 0)) throw new StaleAdmissionObservationError();
+          if (event.expectedGeneration !== observed.generation) throw new StaleAdmissionObservationError();
           const now = Date.now();
           db.prepare('INSERT INTO pulls (repository_id, pull_number, updated_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING')
             .run(repositoryId, pullNumber, now);
-          const generation = (current?.identity.generation ?? 0) + 1;
+          const generation = observed.generation + 1;
           db.prepare("UPDATE attempts SET state = 'superseded', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE repository_id = ? AND pull_number = ? AND state != 'superseded'")
             .run(now, repositoryId, pullNumber);
           db.prepare("UPDATE publications SET state = 'superseded', updated_at = ? WHERE attempt_id IN (SELECT id FROM attempts WHERE repository_id = ? AND pull_number = ?) AND state = 'planned'")
@@ -146,8 +181,8 @@ export function openStore(path: string): Store {
           const id = String(inserted.lastInsertRowid);
           const identity = reviewIdentitySchema.parse({ ...event.identity, attemptId: id, generation });
           db.prepare('UPDATE attempts SET identity_json = ? WHERE id = ?').run(JSON.stringify(identity), id);
-          db.prepare('UPDATE pulls SET generation = ?, current_attempt_id = ?, updated_at = ?, rerun_sequence = ? WHERE repository_id = ? AND pull_number = ?')
-            .run(generation, id, now, event.trigger.kind === 'rerun' ? event.trigger.sequence : rerunSequence, repositoryId, pullNumber);
+          db.prepare('UPDATE pulls SET generation = ?, current_attempt_id = ?, updated_at = ?, rerun_sequence = ?, blocked_reason = NULL, observed_head_sha = ?, observed_base_ref = ? WHERE repository_id = ? AND pull_number = ?')
+            .run(generation, id, now, event.trigger.kind === 'rerun' ? event.trigger.sequence : rerunSequence, event.identity.headSha, event.identity.baseRef, repositoryId, pullNumber);
           admitted = attempt(id);
           kind = 'created';
         }
@@ -198,6 +233,44 @@ export function openStore(path: string): Store {
       const passes = db.prepare('SELECT * FROM passes WHERE attempt_id = ? ORDER BY id').all(record.identity.attemptId).map(readPass);
       const { rerun_sequence: rerunSequence } = z.object({ rerun_sequence: timestampSchema }).parse(row);
       return { ...record, rerunSequence, passes };
+    },
+    observation, accessGeneration, accessAllowed,
+    trackedPulls(installationId) {
+      return db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
+        .map(readAttempt).filter((record) => record.identity.installationId === installationId)
+        .map((record) => ({ repositoryId: record.identity.repositoryId, pullNumber: record.identity.pullNumber }));
+    },
+    trackedInstallations() {
+      return [...new Set(db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
+        .map(readAttempt).map((record) => record.identity.installationId))];
+    },
+    invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef) {
+      timestampSchema.parse(expectedGeneration);
+      transaction(() => invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef));
+    },
+    setAccess(installationId, repositoryId, allowed) {
+      transaction(() => {
+        db.prepare('INSERT INTO access_rules VALUES (?, ?, ?) ON CONFLICT(installation_id, repository_id) DO UPDATE SET allowed = excluded.allowed')
+          .run(installationId, repositoryId ?? '*', allowed ? 1 : 0);
+        db.prepare('UPDATE access_clock SET generation = generation + 1 WHERE id = 1').run();
+        if (allowed) return;
+        const rows = db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all();
+        for (const value of rows) {
+          const record = readAttempt(value);
+          if (record.identity.installationId !== installationId || (repositoryId !== null && record.identity.repositoryId !== repositoryId)) continue;
+          const identity = record.identity;
+          invalidatePull(identity.repositoryId, identity.pullNumber, observation(identity.repositoryId, identity.pullNumber).generation,
+            'access_revoked', identity.headSha, identity.baseRef);
+        }
+      });
+    },
+    receipt(deliveryId) {
+      const value = db.prepare('SELECT result_json FROM webhook_receipts WHERE id = ?').get(deliveryId);
+      return value ? webhookAdmissionSchema.parse(JSON.parse(z.object({ result_json: z.string() }).parse(value).result_json)) : null;
+    },
+    acknowledge(deliveryId, input) {
+      const admission = webhookAdmissionSchema.parse(input);
+      db.prepare('INSERT INTO webhook_receipts VALUES (?, ?, ?) ON CONFLICT DO NOTHING').run(deliveryId, JSON.stringify(admission), Date.now());
     },
     planPublication(input) {
       const intent = publicationIntentSchema.parse(input);

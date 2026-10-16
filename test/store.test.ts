@@ -226,4 +226,26 @@ describe('persistent review ledger', () => {
     expect(store.current('200', 42)?.passes).toHaveLength(1);
     expect(store.admit({ ...event, deliveryId: 'still-works', expectedGeneration: admitted.identity.generation }).kind).toBe('created');
   });
+  it('retains cancelled generations, rerun high-water and receipts across restart', () => {
+    const store = open();
+    const identity = store.admit({ ...event, trigger: { kind: 'rerun', sequence: 3 } }).identity;
+    store.invalidatePull('200', 42, 1, 'skipped', identity.headSha, identity.baseRef);
+    store.acknowledge('cancelled', { kind: 'cancelled', reason: 'skipped' });
+    store.close();
+    const restored = open();
+    expect(restored.observation('200', 42)).toMatchObject({ generation: 2, rerunSequence: 3, blockedReason: 'skipped' });
+    expect(restored.receipt('cancelled')).toEqual({ kind: 'cancelled', reason: 'skipped' });
+    expect(restored.claim(Date.now())).toBeNull();
+    const admitted = restored.admit({ ...event, deliveryId: 'post-restart', expectedGeneration: 2, trigger: { kind: 'rerun', sequence: 4 } });
+    expect(admitted.identity.generation).toBe(3);
+  });
+  it('fences a second base invalidation racing with admission even when head and cancellation reason are unchanged', () => {
+    const store = open();
+    const first = store.admit(event);
+    store.invalidatePull('200', 42, first.identity.generation, 'base_changed', event.identity.headSha, 'main');
+    const observed = store.observation('200', 42);
+    store.invalidatePull('200', 42, observed.generation, 'base_changed', event.identity.headSha, 'main');
+    expect(() => store.admit({ ...event, deliveryId: 'between-base-pushes', expectedGeneration: observed.generation,
+      identity: { ...event.identity, baseSha: 'f'.repeat(40) } })).toThrow(StaleAdmissionObservationError);
+  });
 });

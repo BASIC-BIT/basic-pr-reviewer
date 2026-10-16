@@ -7,6 +7,46 @@ const shaSchema = z.string().regex(/^[0-9a-f]{40}$/);
 const hashSchema = z.string().regex(/^[0-9a-f]{64}$/);
 const sequenceSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 
+const instructionPathSchema = z.string().min(1).max(512).refine((path) =>
+  !path.startsWith('/') && !path.includes('\\') && !path.includes(':') &&
+  path.split('/').every((part) => part !== '' && part !== '.' && part !== '..') &&
+  !/[\x00-\x1f]/.test(path), 'Invalid repository instruction path');
+export const repoPolicySchema = z.strictObject({
+  schemaVersion: z.literal(1), enabled: z.boolean(),
+  baseBranches: z.array(z.string().min(1)).min(1).default(['main']),
+  skipLabels: z.array(z.string().min(1)).default(['skip-review']),
+  rerunOnUnskip: z.boolean().default(false), excludeGlobs: z.array(z.string()).default([]),
+  excludeDocsOnly: z.boolean().default(false), allowBotAuthors: z.boolean().default(false),
+  allowedBotActors: z.array(z.string().min(1)).default([]),
+  contextMode: z.enum(['diff', 'changed-context-only', 'allowlist']).default('changed-context-only'),
+  contextAllowGlobs: z.array(z.string()).default([]), githubLinksOnly: z.boolean().default(false),
+  instructionPaths: z.array(instructionPathSchema).max(32).default([]),
+});
+export type RepoPolicy = z.infer<typeof repoPolicySchema>;
+export const livePullSchema = z.strictObject({
+  installationId: githubIdSchema, repositoryId: githubIdSchema,
+  ownerId: githubIdSchema,
+  headRepositoryId: githubIdSchema.nullable(), baseRepositoryId: githubIdSchema,
+  owner: idSchema, repo: idSchema, pullNumber: sequenceSchema,
+  headSha: shaSchema, baseRef: idSchema, baseSha: shaSchema, mergeBaseSha: shaSchema,
+  draft: z.boolean(), state: z.enum(['open', 'closed']), labels: z.array(z.string()),
+  author: z.strictObject({ login: idSchema, type: z.enum(['User', 'Bot', 'Mannequin']) }),
+});
+export type LivePull = z.infer<typeof livePullSchema>;
+export type TrustedPolicy = {
+  policy: RepoPolicy; policyHash: string;
+  instructions: { path: string; text: string; hash: string }[];
+};
+export const webhookAdmissionSchema = z.union([
+  z.strictObject({ kind: z.enum(['admitted', 'duplicate']), attemptId: githubIdSchema }),
+  z.strictObject({ kind: z.enum(['ignored', 'cancelled', 'configuration_failure']), reason: idSchema }),
+]);
+export type WebhookAdmission = z.infer<typeof webhookAdmissionSchema>;
+export type PullObservation = {
+  generation: number; rerunSequence: number; blockedReason: string | null;
+  observedHeadSha: string | null; observedBaseRef: string | null;
+};
+
 export const reviewInputSchema = z.strictObject({
   installationId: githubIdSchema,
   repositoryId: githubIdSchema,
@@ -32,6 +72,7 @@ export const admittedEventSchema = z.strictObject({
   receivedAt: timestampSchema,
   // Read before resolving live identity; a fresh transition must still match this observation.
   expectedGeneration: timestampSchema,
+  expectedAccessGeneration: timestampSchema.optional(),
   identity: reviewInputSchema,
   trigger: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('automatic') }),
@@ -134,6 +175,16 @@ export interface Store {
   claim(now: number): ClaimedAttempt | null;
   savePass(identity: ReviewIdentity, spec: PassSpec, outcome: PassOutcome): void;
   current(repositoryId: string, pullNumber: number): PullRecord | null;
+  trackedPulls(installationId: string): { repositoryId: string; pullNumber: number }[];
+  trackedInstallations(): string[];
+  observation(repositoryId: string, pullNumber: number): PullObservation;
+  invalidatePull(repositoryId: string, pullNumber: number, expectedGeneration: number,
+    reason: string, headSha: string | null, baseRef: string | null): void;
+  accessGeneration(): number;
+  accessAllowed(installationId: string, repositoryId: string): boolean;
+  setAccess(installationId: string, repositoryId: string | null, allowed: boolean): void;
+  receipt(deliveryId: string): WebhookAdmission | null;
+  acknowledge(deliveryId: string, admission: WebhookAdmission): void;
   planPublication(intent: PublicationIntent): PublicationRecord;
   backup(path: string): Promise<void>;
   close(): void;

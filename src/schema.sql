@@ -3,6 +3,9 @@ CREATE TABLE pulls (
   pull_number INTEGER NOT NULL CHECK (pull_number > 0),
   generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
   rerun_sequence INTEGER NOT NULL DEFAULT 0 CHECK (rerun_sequence >= 0),
+  blocked_reason TEXT,
+  observed_head_sha TEXT,
+  observed_base_ref TEXT,
   current_attempt_id INTEGER REFERENCES attempts(id),
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (repository_id, pull_number)
@@ -55,4 +58,19 @@ CREATE TABLE publications (
   UNIQUE (attempt_id, publication_key)
 ) STRICT;
 
-PRAGMA user_version = 1;
+CREATE TABLE webhook_receipts (
+  id TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+  received_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE access_rules (
+  installation_id TEXT NOT NULL,
+  repository_id TEXT NOT NULL,
+  allowed INTEGER NOT NULL CHECK (allowed IN (0, 1)),
+  PRIMARY KEY (installation_id, repository_id)
+) STRICT;
+CREATE TABLE access_clock (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL) STRICT;
+INSERT INTO access_clock VALUES (1, 0);
+
+PRAGMA user_version = 2;

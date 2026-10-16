@@ -3,13 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.18.0 <25" },
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node --input-type=module -e \"import {copyFileSync} from 'node:fs'; copyFileSync('src/schema.sql', 'dist/schema.sql');\""
   },
-  "dependencies": { "zod": "4.6.7" },
+  "dependencies": {
+    "@octokit/auth-app": "8.3.1",
+    "@octokit/core": "7.0.8",
+    "@octokit/webhooks": "14.2.0",
+    "zod": "4.6.7"
+  },
   "devDependencies": {
     "@types/node": "24.19.2",
     "typescript": "7.0.2",
