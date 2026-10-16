@@ -141,6 +141,17 @@ describe('persistent review ledger', () => {
     expect(() => store.savePass(admitted.identity, spec, { ...outcome, findings: [] })).toThrow(/completed pass/i);
   });
 
+  it('never persists materialized metadata or captured instruction text', () => {
+    const store = open(), admitted = store.admit(event);
+    store.savePass(admitted.identity, { ...spec, trustedInstructions: [{ path: 'AGENTS.md', text: 'PRIVATE_SOURCE_SENTINEL', hash: 'a'.repeat(64) }] }, outcome);
+    const database = new DatabaseSync(path);
+    try {
+      const row = database.prepare('SELECT spec_json FROM passes').get();
+      const serialized = String(row?.spec_json);
+      for (const forbidden of ['bundlePath', 'reviewUnits', 'sourceMap', 'trustedInstructions', 'PRIVATE_SOURCE_SENTINEL']) expect(serialized).not.toContain(forbidden);
+    } finally { database.close(); }
+  });
+
   it('leases an attempt to one connection and reclaims it only after expiry', () => {
     const firstStore = open();
     const secondStore = open();

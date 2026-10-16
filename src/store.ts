@@ -207,7 +207,8 @@ export function openStore(path: string): Store {
     },
     savePass(identityInput, specInput, outcomeInput) {
       const identity = reviewIdentitySchema.parse(identityInput);
-      const { bundlePath: _path, ...planned } = 'bundlePath' in specInput ? passSpecSchema.parse(specInput) : { ...plannedPassSchema.parse(specInput), bundlePath: null };
+      const { bundlePath: _path, reviewUnits: _units, sourceMap: _map, trustedInstructions: _instructions, ...planned } = 'bundlePath' in specInput
+        ? passSpecSchema.parse(specInput) : { ...plannedPassSchema.parse(specInput), bundlePath: null, reviewUnits: [], sourceMap: [], trustedInstructions: [] };
       const spec = plannedPassSchema.parse(planned);
       const outcome = validatePassOutcome(spec, outcomeInput);
       transaction(() => {

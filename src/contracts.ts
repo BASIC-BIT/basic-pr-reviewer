@@ -168,7 +168,12 @@ export const plannedPassSchema = z.strictObject({
   reusedFrom: idSchema.nullable().default(null),
 }).refine((spec) => new Set(spec.unitIds).size === spec.unitIds.length, 'Duplicate unit IDs');
 export type PlannedPass = z.infer<typeof plannedPassSchema>;
-export const passSpecSchema = plannedPassSchema.safeExtend({ bundlePath: idSchema });
+export const passSpecSchema = plannedPassSchema.safeExtend({
+  bundlePath: idSchema, reviewUnits: z.array(reviewUnitSchema), sourceMap: z.array(bundleMappingSchema),
+  trustedInstructions: z.array(z.strictObject({ path: idSchema, text: z.string(), hash: hashSchema })),
+}).refine((spec) => spec.reviewUnits.length === spec.unitIds.length &&
+  new Set(spec.reviewUnits.map((unit) => unit.id)).size === spec.unitIds.length &&
+  spec.reviewUnits.every((unit) => spec.unitIds.includes(unit.id)), 'Invalid materialized unit assignment');
 export type PassSpec = z.infer<typeof passSpecSchema>;
 
 const passOutcomeBaseSchema = z.strictObject({

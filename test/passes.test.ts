@@ -1,4 +1,5 @@
 import { readdir, readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Manifest, PassRecord, PlannedPass } from '../src/contracts.js';
@@ -18,6 +19,22 @@ const entries = [
 ];
 
 describe('trusted coverage planning', { timeout: 120000 }, () => {
+  it('materializes only captured trusted instruction content, independent of caller mutation', async () => {
+    const neighbor = { path: 'private/context.ts', text: 'context must stay excluded' };
+    const f = await fixture([neighbor], [...entries, neighbor]);
+    const p = policy({ contextMode: 'allowlist', contextAllowGlobs: ['packages/**'] }), { source } = await service(f);
+    const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+    p.instructions.push({ path: 'REVIEW.md', text: 'Captured guidance', hash: hash('Captured guidance') });
+    p.policyHash = hash(JSON.stringify({ policy: p.policy, instructions: p.instructions.map(({ path, hash }) => ({ path, hash })) }));
+    const capture = source.captureManifest(identity(f, p), p);
+    p.instructions[0]!.text = 'Changed after capture';
+    p.policy.contextAllowGlobs.push('**');
+    const m = await capture;
+    const pass = planCoverage(m, [], await source.verifyAncestry(m, [])).freshPasses[0]!;
+    const materialized = await source.materializePass(m, pass);
+    expect(materialized.spec.trustedInstructions[0]?.text).toBe('Captured guidance');
+    expect(materialized.spec.sourceMap.some(entry => Buffer.from(entry.path.bytesBase64, 'base64').toString() === neighbor.path)).toBe(false);
+  });
   it('reuses only completed compatible scope from an incomplete baseline and always schedules current integration', async () => {
     const f = await fixture([], entries), p = policy(), { source } = await service(f);
     const first = await source.captureManifest(identity(f, p), p);
@@ -63,6 +80,8 @@ describe('trusted coverage planning', { timeout: 120000 }, () => {
     expect(text).toContain('shared contract');
     expect(text).not.toContain('beta context');
     expect(runnable.spec.bundlePath).toBe(runnable.bundle.directory);
+    expect(runnable.spec.reviewUnits.map((unit) => unit.id).sort()).toEqual([...scope.unitIds].sort());
+    expect(runnable.spec.sourceMap).toEqual(runnable.bundle.sourceMap);
     expect(runnable.bundle.contextHash).toBe(scope.contextHash);
     await expect(source.materializePass(m, { ...scope, contextHash: '0'.repeat(64) })).rejects.toThrow(/descriptor|context/i);
     await expect(source.materializePass(m, { ...scope, initialAliases: ['../../host-config'] })).rejects.toThrow(/initial|descriptor/i);

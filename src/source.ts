@@ -291,9 +291,10 @@ process.stdin.on('end', () => {
     const instructions = trusted.instructions.map((item) => ({ path: item.path, hash: hash(item.text) }));
     if (instructions.some((item, index) => item.hash !== trusted.instructions[index]?.hash) ||
       hash(JSON.stringify({ policy, instructions })) !== identity.policyHash || trusted.policyHash !== identity.policyHash) throw new Error('Trusted policy identity mismatch');
+    const capturedPolicy = { ...trusted, policy, instructions: trusted.instructions.map((item) => ({ ...item })) };
     const workspace = await mkdtemp(join(root, 'capture-')), directory = join(workspace, 'objects.git');
     const manifest: Manifest = { identity, units: [], exclusions: [], retrievalFailures: [], sourceMap: [], workspace, bundleInputs: [], bundleOmissions: [], maxBundleBytes: limits.maxBundleBytes };
-    const snapshot: Snapshot = { manifest, policy: { ...trusted, policy }, blobs: new Map(), patches: new Map(), files: new Map(), context: [] };
+    const snapshot: Snapshot = { manifest, policy: capturedPolicy, blobs: new Map(), patches: new Map(), files: new Map(), context: [] };
     try {
       await git(directory, ['init', '--bare', '--template='], undefined, signal);
       await fetchObjects({ directory, identity, ...(signal ? { signal } : {}) });
@@ -447,7 +448,9 @@ process.stdin.on('end', () => {
       planned.initialAliases.reduce((sum, alias) => sum + (snapshot.files.get(alias)?.length ?? 0), 0) !== planned.initialBytes ||
       planned.kind === 'scope' && planned.initialAliases.length !== diffAliases.size) throw new Error('Invalid initial bundle descriptor');
     const bundle = await materializeBundle(manifest, planned.unitIds, signal, planned.groupId);
-    return { spec: { ...planned, bundlePath: bundle.directory }, bundle };
+    return { spec: { ...planned, bundlePath: bundle.directory,
+      reviewUnits: manifest.units.filter((unit) => planned.unitIds.includes(unit.id)), sourceMap: bundle.sourceMap,
+      trustedInstructions: snapshot.policy.instructions.map((item) => ({ ...item })) }, bundle };
   }
 
   async function verifyAncestry(manifest: Manifest, heads: string[], signal?: AbortSignal): Promise<Ancestry> {
