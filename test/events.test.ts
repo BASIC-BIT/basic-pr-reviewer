@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAdmissionService } from '../src/events.js';
 import { loadPolicy } from '../src/policy.js';
 import { openStore } from '../src/store.js';
+import { createRetention } from '../src/retention.js';
 import { GitHubAccessError } from '../src/github.js';
 import type { AdmissionGitHubPort } from '../src/github.js';
 import type { LivePull, RepoPolicy, Store } from '../src/contracts.js';
@@ -534,4 +535,27 @@ it('retains and purges configuration notices that never admitted an attempt',asy
   github.live.state='closed';await service.reconcileInstalled();
   store.observePullState('200',42,'open',0);store.observePullState('200',42,'closed',1000);
   expect(store.purgeClosedBefore(1000)).toBe(1);expect(store.publicationNotices()).toEqual([]);expect(store.publicationOperations('200',42)).toEqual([]);expect(store.receipt('configuration-notice')).toBeNull();
+});
+
+it('expires orphan comment and check receipts while preserving tracked open and closure retention',async()=>{
+  const day=86400000,start=Date.now();let now=start;const clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
+  try {
+    const {store,github,service}=setup();github.live.state='closed';
+    const comment=(number:number)=>payload('created',{issue:{number,pull_request:{}},comment:{id:501,body:'ordinary comment',user:{login:'human',type:'User'}}});
+    await send(service,comment(42),'issue_comment','orphan-comment');
+    await send(service,payload('completed',{check_run:{id:502,app:{id:999},pull_requests:[{number:42}]}}),'check_run','orphan-check');
+    expect(github.calls).toEqual([]);expect(store.trackedPulls('100')).toEqual([]);
+    github.live={...pull,pullNumber:43};await send(service,payload('opened',{number:43,pull_request:{number:43}}));
+    await send(service,comment(43),'issue_comment','open-comment');
+    github.live={...pull,pullNumber:44};await send(service,payload('opened',{number:44,pull_request:{number:44}}));
+    await send(service,comment(44),'issue_comment','closed-comment');
+    now=start+10*day;github.live.state='closed';await send(service,payload('closed',{number:44,pull_request:{number:44}}));
+    const retention=createRetention({store});now=start+29*day;await retention.purgeExpired(now);
+    expect(store.receipt('orphan-comment')).not.toBeNull();expect(store.receipt('orphan-check')).not.toBeNull();
+    now=start+30*day;await retention.purgeExpired(now);
+    expect(store.receipt('orphan-comment')).toBeNull();expect(store.receipt('orphan-check')).toBeNull();
+    expect(store.receipt('open-comment')).not.toBeNull();expect(store.receipt('closed-comment')).not.toBeNull();
+    now=start+40*day;await retention.purgeExpired(now);expect(store.receipt('closed-comment')).toBeNull();
+    now=start+60*day;await retention.purgeExpired(now);expect(store.receipt('open-comment')).not.toBeNull();
+  } finally {clock.mockRestore();}
 });

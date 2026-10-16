@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { openStore } from './store.js';
 import { createGitHubAdapter } from './github.js';
 import { createSourceService } from './source.js';
-import { createWorker } from './worker.js';
+import { createWorker, profile } from './worker.js';
 import { verifyRelease } from './release.js';
 import { createBackups } from './retention.js';
 import { startService } from './main.js';
@@ -58,7 +58,7 @@ export async function assertFlock(path: string): Promise<void> {
 }
 export async function controlRequest(socketPath: string, command: OperatorCommand): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const req = request({ socketPath, path: '/control', method: 'POST', timeout: 120000, headers: { 'content-type': 'application/json' } }, response => {
+    const req = request({ socketPath, path: '/control', method: 'POST', timeout: command.command === 'pause' ? profile.timeoutMs + 15 * 60 * 1000 : 120000, headers: { 'content-type': 'application/json' } }, response => {
       const chunks: Buffer[] = []; let size = 0;
       response.on('data', (chunk: Buffer) => { size += chunk.length; if (size > 16 * 1024 * 1024) req.destroy(new Error('control_response_limit')); else chunks.push(chunk); });
       response.on('error', reject);

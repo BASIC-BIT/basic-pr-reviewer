@@ -555,7 +555,9 @@ export function openStore(path: string): Store {
           db.prepare('DELETE FROM attempts WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
           db.prepare('DELETE FROM pulls WHERE repository_id = ? AND pull_number = ?').run(repositoryId, pullNumber);
         }
-        db.prepare('DELETE FROM webhook_receipts WHERE repository_id IS NULL AND received_at <= ?').run(cutoff);
+        db.prepare(`DELETE FROM webhook_receipts WHERE received_at <= ? AND NOT EXISTS (
+          SELECT 1 FROM pulls p WHERE p.repository_id = webhook_receipts.repository_id AND p.pull_number = webhook_receipts.pull_number
+        )`).run(cutoff);
         return expired.length;
       });
     },

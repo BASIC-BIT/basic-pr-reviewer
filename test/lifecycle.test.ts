@@ -1,4 +1,7 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import { Socket } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
+import { profile } from '../src/worker.js';
 import { createHmac, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
@@ -200,3 +203,23 @@ it('does not acknowledge pause until active inference has drained and prevents s
   await new Promise(resolve=>setImmediate(resolve));expect(drained).toBe(false);finish();await Promise.all([cycle,pause]);
   expect(drained).toBe(true);expect(f.owned).toHaveLength(0);await service.cycle();expect(f.calls).toHaveLength(1);
 });
+
+it('waits through a full pass drain over the real control transport while retaining short waits for other commands',async()=>{
+  const f=await setup();const service=await f.start();await f.send(service,'opened');
+  let entered:()=>void=()=>{},finish:()=>void=()=>{};
+  const started=new Promise<void>(resolve=>{entered=resolve;}),pending=new Promise<void>(resolve=>{finish=resolve;});
+  f.setHook(async()=>{entered();await pending;});const cycle=service.cycle();await started;
+  const original=Socket.prototype.setTimeout;const timeouts:number[]=[];
+  const timing=vi.spyOn(Socket.prototype,'setTimeout').mockImplementation(function(this:Socket,ms,callback){
+    timeouts.push(ms);return original.call(this,ms/1000,callback);
+  });
+  let outcome:unknown='pending';const pause=controlRequest(f.socket,{command:'pause'}).then(result=>{outcome=result;},error=>{outcome=error;});
+  try {
+    await vi.waitFor(async()=>expect((await service.health()).paused).toBe(true));
+    await delay((profile.timeoutMs+60000)/1000);expect(outcome).toBe('pending');
+    finish();await Promise.all([pause,cycle]);expect(outcome).toEqual({paused:true,drained:true});expect(f.owned).toHaveLength(0);
+    timeouts.length=0;await controlRequest(f.socket,{command:'inspect',repositoryId:'2',pullNumber:3});expect(timeouts).toContain(120000);
+    f.failPauseWrites();await expect(controlRequest(f.socket,{command:'resume'})).rejects.toThrow('operator_command_failed');
+    expect(await service.health()).toMatchObject({paused:true,healthy:false,reason:'pause_state_failed'});
+  } finally {finish();await Promise.all([pause,cycle]);timing.mockRestore();}
+},15000);
