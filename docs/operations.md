@@ -80,6 +80,49 @@ For disaster recovery, stop the service and hold its exclusive lock. Preserve th
 
 ## Release and synthetic acceptance
 
+### Single-publisher handoff
+
+Use the target repository's policy, required checks and recorded legacy workflow
+inventory with this sequence. Source preparation does not authorize default-branch
+changes, infrastructure, credential access, inference or publication. Obtain the
+applicable approvals for the exact target and establish trusted default policy
+through the approved baseline procedure while legacy remains the sole publisher.
+
+1. Verify read access and exact repository, installation, head/base, policy and
+   release identities. For a finite shadow, follow the ownership and admission
+   procedure below: persist pause, obtain a successful drain, stop the normal
+   service and hold its production lock. Let any approved legacy run finish before
+   shadow inference so only one inference owner is active. Shadow uses the same
+   production ledger, has no publisher or publication acknowledgements, and cannot
+   prove COMMENT, inline, sticky, check or thread-resolution permissions.
+2. Inspect saved coverage and pending publication intents. Keep execution and
+   publication durably paused. Before target writes, obtain the approved legacy
+   shutdown: disable the recorded workflows, cancel queued/in-flight legacy jobs
+   and verify terminal status. Workflow deletion in a branch is not shutdown proof.
+3. Only after that terminal proof and explicit target publication/cutover approval,
+   continue the finite publication pilot below or resume the normal service under
+   its sole ownership lock. Refresh admission when head, base, policy or release
+   changed. Prove target COMMENT, inline, sticky and exact-head check publication
+   and actual thread permissions, including the limits on resolving App-owned
+   verified-fixed findings without human replies. Record remote receipts and
+   confirm one inference owner and publisher. An earlier separately approved
+   fixture can prove only its own permissions; it is not target cutover proof.
+4. On the approved disposable acceptance PR, verify push, labels, skip/unskip,
+   draft/ready, retarget, close/reopen, base invalidation, authorized rerun,
+   publication failure and revocation. Retain repository-specific current-head
+   review gates and required checks. Missing live evidence remains UNKNOWN.
+
+Shadow leaves pending intents in the production ledger. Never use an alternate
+ledger, erase receipts or resume implicitly to clear them. Keep pause until their
+publication is approved or abandon the pilot through the normal authorized
+skip/close and paused reconciliation procedure below. Cancellation itself does
+not authorize notices or other queued publication.
+
+Rollback pauses and drains App execution/publication, stops its in-flight work,
+then restores the recorded prior workflows and proves only the legacy owner is
+active. Preserve the ledger and handle queued intents explicitly before any later
+App resume. Engine rollback alone does not restore retired workflows.
+
 ### Finite GitHub pilot
 
 Live pilot execution needs separate human approval of the target, credential access, input scope, inference budget and publication. CLI flags record operator intent; they do not grant that approval. The two existing synthetic commands below remain offline.
