@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { livePullSchema, timestampSchema } from './contracts.js';
 import type { LivePull, RepoPolicy, Store, WebhookAdmission } from './contracts.js';
 import { GitHubAccessError } from './github.js';
-import type { GitHubPort } from './github.js';
+import type { AdmissionGitHubPort } from './github.js';
 import { ConfigurationError, loadPolicy } from './policy.js';
 import { StaleAdmissionObservationError } from './store.js';
 
@@ -32,7 +32,7 @@ function ineligible(pull: LivePull, policy: RepoPolicy, actor: Actor | null): st
 }
 
 export function createAdmissionService(options: {
-  store: Store; github: GitHubPort; webhookSecret: string; appId: string;
+  store: Store; github: AdmissionGitHubPort; webhookSecret: string; appId: string;
   ownerIds: string[]; runtimeHash: string;
 }) {
   const { store, github } = options;
@@ -64,7 +64,7 @@ export function createAdmissionService(options: {
         accessGeneration = store.restoreAccess(context.installationId, context.repositoryId, accessGeneration);
         function cancel(reason: string): WebhookAdmission {
           if (store.accessGeneration() !== accessGeneration) throw new StaleAdmissionObservationError();
-          store.invalidatePull(context.repositoryId, context.pullNumber, observed.generation, reason, pull.headSha, pull.baseRef);
+          store.invalidatePull(context.repositoryId, context.pullNumber, observed.generation, reason, pull.headSha, pull.baseRef, pull);
           return { kind: 'cancelled', reason };
         }
         if (context.kind === 'base') {

@@ -1,6 +1,6 @@
 import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { createGitHubAdapter, GitHubAccessError } from '../src/github.js';
+import { createGitHubAdapter, GitHubAccessError, GitHubPermissionError } from '../src/github.js';
 import { createAdmissionService } from '../src/events.js';
 import { openStore } from '../src/store.js';
 
@@ -31,6 +31,71 @@ function setup(handler?: (path: string) => { status: number; data: unknown; head
   return { calls, github: createGitHubAdapter({ appId: '300', privateKey: key, ownerIds: ['400'], fetch: transport }) };
 }
 describe('Octokit installation adapter with synthetic HTTP transport', () => {
+  it('paginates owned publications and limits mutation tokens to the repository and operation', async () => {
+    let comments = 0, reviews = 0, checks = 0;
+    const { calls, github } = setup(path => {
+      if (path === '/app') return { status: 200, data: { slug: 'fixture-reviewer' } };
+      if (path === '/users/fixture-reviewer%5Bbot%5D' || path === '/users/fixture-reviewer[bot]') return { status: 200, data: { id: 500 } };
+      if (path.endsWith('/issues/42/comments')) return { status: 200, data: ++comments === 1
+        ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: 'untrusted marker', user: { id: 999 }, performed_via_github_app: null }))
+        : [{ id: 501, body: 'owned summary', user: { id: 500 }, performed_via_github_app: { id: 300 } }] };
+      if (path.endsWith('/pulls/42/reviews')) return { status: 200, data: ++reviews === 1
+        ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: 'other', user: { id: 999 }, commit_id: head }))
+        : [{ id: 502, body: 'owned review', user: { id: 500 }, commit_id: head }] };
+      if (path.includes('/commits/')) return { status: 200, data: { check_runs: ++checks === 1
+        ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1, app: { id: 999 }, head_sha: head, output: { summary: 'other' } }))
+        : [{ id: 503, app: { id: 300 }, head_sha: head, output: { summary: 'owned check' } }] } };
+      if (path.endsWith('/issues/comments/501')) return { status: 200, data: { id: 501 } };
+      if (path.endsWith('/check-runs/503')) return { status: 200, data: { id: 503 } };
+      return undefined;
+    });
+    const target = { installationId: '100', repositoryId: '200', owner: 'trusted-owner', repo: 'fixture', pullNumber: 42,
+      headSha: head, baseSha: base, baseRef: 'main', mergeBaseSha: merge };
+    expect(await github.listOwnedPublications(target)).toEqual([
+      { id: '501', body: 'owned summary', channel: 'summary', headSha: null },
+      { id: '502', body: 'owned review', channel: 'inline', headSha: head },
+      { id: '503', body: 'owned check', channel: 'check', headSha: head },
+    ]);
+    await github.upsertSummary(target, '501', 'safe body');
+    await github.upsertCheck(target, '503', { headSha: head, body: 'safe check', status: 'completed', conclusion: 'neutral' });
+    const tokenBodies = calls.filter(call => call.url.pathname.endsWith('/access_tokens')).map(call => JSON.parse(call.body || '{}'));
+    expect(tokenBodies).toContainEqual({ repository_ids: [200], permissions: { pull_requests: 'write' } });
+    expect(tokenBodies).toContainEqual({ repository_ids: [200], permissions: { checks: 'write' } });
+    expect(JSON.parse(calls.find(call => call.url.pathname.endsWith('/check-runs/503'))!.body)).not.toHaveProperty('head_sha');
+    expect(tokenBodies.some(body => body.permissions?.contents === 'write' || body.permissions?.issues === 'write')).toBe(false);
+    expect(calls.filter(call => call.url.searchParams.get('page') === '2')).toHaveLength(3);
+  });
+  it('binds COMMENT reviews to the trusted commit and paginates thread roots without fetching human reply text', async () => {
+    let page = 0;
+    const { calls, github } = setup(path => {
+      if (path === '/app') return { status: 200, data: { slug: 'fixture-reviewer' } };
+      if (path.startsWith('/users/fixture-reviewer')) return { status: 200, data: { id: 500 } };
+      if (path.endsWith('/pulls/42/reviews')) return { status: 200, data: { id: 502 } };
+      if (path === '/graphql') return { status: 200, data: { data: { repository: { pullRequest: { reviewThreads: {
+        pageInfo: { hasNextPage: ++page === 1, endCursor: page === 1 ? 'next' : null },
+        nodes: [{ id: `thread-${page}`, isResolved: false, comments: { totalCount: page === 1 ? 2 : 1,
+          nodes: [{ body: 'root', author: { databaseId: 500 }, pullRequestReview: { databaseId: 502 } }] } }],
+      } } } } } };
+      return undefined;
+    });
+    const target = { installationId: '100', repositoryId: '200', owner: 'trusted-owner', repo: 'fixture', pullNumber: 42,
+      headSha: head, baseSha: base, baseRef: 'main', mergeBaseSha: merge };
+    await github.createReview(target, { commitId: head, body: 'finding', comments: [{ path: 'new.ts', side: 'LEFT', line: 7, body: 'root' }] });
+    expect(JSON.parse(calls.find(call => call.url.pathname.endsWith('/reviews'))!.body)).toMatchObject({ event: 'COMMENT', commit_id: head,
+      comments: [{ path: 'new.ts', side: 'LEFT', line: 7 }] });
+    await expect(github.createReview(target, { commitId: base, body: 'wrong', comments: [] })).rejects.toThrow(/commit mismatch/);
+    expect((await github.listThreads(target)).map(thread => thread.hasReplies)).toEqual([true, false]);
+    expect(calls.filter(call => call.url.pathname === '/graphql').map(call => JSON.parse(call.body).variables.after)).toEqual([null, 'next']);
+  });
+  it('reports unavailable thread permissions without requesting Contents write', async () => {
+    const { calls, github } = setup(path => path === '/graphql' ? { status: 403, data: { message: 'Resource not accessible by integration' } } : undefined);
+    const target = { installationId: '100', repositoryId: '200', owner: 'trusted-owner', repo: 'fixture', pullNumber: 42,
+      headSha: head, baseSha: base, baseRef: 'main', mergeBaseSha: merge };
+    await expect(github.resolveThread(target, 'thread-node')).rejects.toThrow(GitHubPermissionError);
+    const tokens = calls.filter(call => call.url.pathname.endsWith('/access_tokens')).map(call => JSON.parse(call.body || '{}'));
+    expect(tokens.at(-1)).toEqual({ repository_ids: [200], permissions: { pull_requests: 'write' } });
+    expect(tokens.some(token => token.permissions?.contents === 'write')).toBe(false);
+  });
   it('provides a host-only contents-read credential scoped to the verified repository', async () => {
     const { calls, github } = setup();
     const credential = await github.installationCredential({ installationId: '100', repositoryId: '200', owner: 'trusted-owner', repo: 'fixture' });

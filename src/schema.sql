@@ -88,4 +88,14 @@ CREATE TABLE access_rules (
 CREATE TABLE access_clock (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL) STRICT;
 INSERT INTO access_clock VALUES (1, 0);
 
-PRAGMA user_version = 3;
+CREATE TABLE publication_notices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, repository_id TEXT NOT NULL, pull_number INTEGER NOT NULL,
+  notice_json TEXT NOT NULL CHECK(json_valid(notice_json)),
+  FOREIGN KEY(repository_id, pull_number) REFERENCES pulls(repository_id, pull_number)
+) STRICT;
+CREATE TABLE publication_operations (
+  operation_key TEXT PRIMARY KEY, repository_id TEXT NOT NULL, pull_number INTEGER NOT NULL,
+  operation_json TEXT NOT NULL CHECK(json_valid(operation_json)),
+  FOREIGN KEY(repository_id, pull_number) REFERENCES pulls(repository_id, pull_number)
+) STRICT;
+PRAGMA user_version = 4;

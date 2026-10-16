@@ -69,7 +69,7 @@ describe('worker ownership', () => {
     const store = ledger(), identity = store.admit(event).identity, claim = store.claim(1000)!;
     expect(() => store.settle(identity, { token: claim.lease.token, now: 1001 }, { state: 'complete', reason: null, nextAttemptAt: 1001, result: null })).toThrow(/missing complete/i);
     expect(store.current(identity.repositoryId, identity.pullNumber)?.state).toBe('leased');
-    expect(store.publications(identity.repositoryId, identity.pullNumber)).toEqual([]);
+    expect(store.publications(identity.repositoryId, identity.pullNumber).filter(record => record.state === 'planned').every(record => JSON.parse(record.intent.body).state === 'leased')).toBe(true);
   });
 });
 
@@ -300,7 +300,7 @@ describe('ledger scheduler', { timeout: 120000 }, () => {
     await Promise.all([f.scheduler.tick(f.now()), f.scheduler.tick(f.now())]);
     expect(f.calls).toHaveLength(1);
     expect(f.store.current(f.id.repositoryId, f.id.pullNumber)).toMatchObject({ state: 'queued', identity: { headSha: head, generation: 2 }, passes: [] });
-    expect(f.store.publications(f.id.repositoryId, f.id.pullNumber)).toEqual([]);
+    expect(f.store.publications(f.id.repositoryId, f.id.pullNumber).filter(record => record.state === 'planned').every(record => record.intent.identity.generation === 2 && JSON.parse(record.intent.body).state === 'queued')).toBe(true);
     expect(await readdir(f.root)).toEqual([]);
   });
 

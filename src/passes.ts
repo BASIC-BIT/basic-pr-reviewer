@@ -56,9 +56,10 @@ function currentPasses(manifest: Manifest, covered = new Set<string>()): Planned
   return result;
 }
 
-function withFindings(spec: PlannedPass, findings: PlannedPass['priorFindings']): PlannedPass {
+function withFindings(spec: PlannedPass, findings: PlannedPass['priorFindings'], assessments: PlannedPass['priorFindings'] = []): PlannedPass {
   const priorFindings = [...new Map(findings.map((finding) => [finding.id, finding])).values()].sort((a, b) => a.id.localeCompare(b.id));
-  return { ...spec, id: hash({ sourcePassId: spec.id, priorFindings }), priorFindings };
+  const assessmentFindings = [...new Map(assessments.map(finding => [finding.id, finding])).values()].sort((a, b) => a.id.localeCompare(b.id));
+  return { ...spec, id: hash({ sourcePassId: spec.id, priorFindings, assessmentFindings }), priorFindings, assessmentFindings };
 }
 
 function compatibleIdentity(old: ReviewIdentity, current: ReviewIdentity): boolean {
@@ -116,7 +117,16 @@ export function planCoverage(input: Manifest, previous: PassRecord[], ancestry: 
   const integrationIndex = freshPasses.findIndex((pass) => pass.kind === 'integration');
   const integration = freshPasses[integrationIndex];
   const currentScopes = previous.filter((record) => same(record.identity, manifest.identity) && currentScope(manifest, record));
-  if (integration) freshPasses[integrationIndex] = withFindings(integration, [...reusedPasses, ...currentScopes].flatMap((record) => record.outcome.findings));
+  if (integration) {
+    const currentFindings = [...reusedPasses, ...currentScopes].flatMap(record => record.outcome.findings);
+    const readable = new Set(describeBundle(manifest, integration.unitIds, null).sourceMap.map(entry => entry.path.bytesBase64));
+    const retained = previous.filter(record => record.identity.attemptId !== manifest.identity.attemptId &&
+      compatibleIdentity(record.identity, manifest.identity) && ancestry.ancestorHeadShas.includes(record.identity.headSha))
+      .filter(record => { try { validatePassOutcome(record.spec, record.outcome); return true; } catch { return false; } })
+      .flatMap(record => record.outcome.findings).filter(finding => finding.location.path && readable.has(finding.location.path.bytesBase64) &&
+        !currentFindings.some(current => current.id === finding.id));
+    freshPasses[integrationIndex] = withFindings(integration, currentFindings, retained);
+  }
   return { freshPasses, reusedPasses, reusedPassIds: [...used],
     invalidatedPassIds: previous.filter((record) => !used.has(record.id)).map((record) => record.id),
     uncoveredUnitIds: manifest.units.filter((unit) => !covered.has(unit.id)).map((unit) => unit.id) };
@@ -136,7 +146,7 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
   for (const record of [...outcomes].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id))) {
     if (!same(record.identity, identity) || accepted.has(record.spec.id)) continue;
     if (currentScope(manifest, record) || integration && record.spec.reusedFrom === null &&
-      validRecord(record, withFindings(integration, record.spec.priorFindings))) accepted.set(record.spec.id, record);
+      validRecord(record, withFindings(integration, record.spec.priorFindings, record.spec.assessmentFindings))) accepted.set(record.spec.id, record);
   }
   for (const record of [...accepted.values()].filter((item) => item.spec.kind === 'scope')) {
     const spec = record.spec;
@@ -149,16 +159,22 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
       covered.add(id); if (record.spec.reusedFrom) reused.add(id);
     }
   }
+  let priorFindingAssessments: NonNullable<ReviewResult['priorFindingAssessments']> = [];
   if (integration) {
-    const expected = withFindings(integration, [...findings.values()]);
     const candidates = [...accepted.values()].filter((record) => record.spec.kind === 'integration');
-    const current = candidates.find((record) => record.spec.id === expected.id) ?? candidates[0];
+    const current = candidates.find(record => record.spec.id === withFindings(integration, [...findings.values()], record.spec.assessmentFindings).id) ?? candidates[0];
+    const expected = withFindings(integration, [...findings.values()], current?.spec.assessmentFindings);
     for (const record of candidates) {
       for (const finding of record.outcome.findings) findings.set(finding.id, finding);
       if (record.outcome.failureCode) failureCodes.add(record.outcome.failureCode);
     }
     if (current) {
       integrationStatus = current.outcome.status;
+      const readable = new Set(describeBundle(manifest, integration.unitIds, null).sourceMap.map(entry => entry.path.bytesBase64));
+      priorFindingAssessments = current.outcome.priorFindingAssessments.map(assessment => {
+        const finding = [...current.spec.priorFindings, ...(current.spec.assessmentFindings ?? [])].find(finding => finding.id === assessment.findingId);
+        return { ...assessment, assessment: finding?.location.path && readable.has(finding.location.path.bytesBase64) ? assessment.assessment : 'uncertain' };
+      });
       if (integrationStatus === 'completed' && (current.spec.id !== expected.id || missing(integration.omissions).length > 0)) {
         integrationStatus = 'incomplete';
         if (current.spec.id !== expected.id) failureCodes.add('integration_findings_mismatch');
@@ -173,6 +189,19 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
   const complete = missingUnitIds.length === 0 && missingScope.length === 0 && integrationStatus === 'completed';
   return { identity, complete, status: skipped ? 'skipped' : complete ? 'complete' : 'incomplete', reason: skipped ? 'no_eligible_scope' : null,
     coveredUnitIds: [...covered].sort(), reusedUnitIds: [...reused].sort(), missingUnitIds,
-    integrationStatus, findings: [...findings.values()], exclusions: unique(exclusions), missingScope: unique(missingScope),
+    integrationStatus, reviewUnits: manifest.units, priorFindingAssessments: complete ? priorFindingAssessments : [], findings: [...findings.values()], exclusions: unique(exclusions), missingScope: unique(missingScope),
     failureCodes: [...failureCodes].sort(), generation: identity.generation, publicationState: 'unpublished' };
+}
+
+export function validateIntegrationInputs(input: Manifest, spec: PlannedPass): void {
+  const manifest = manifestSchema.parse(input);
+  if (spec.kind !== 'integration') {
+    if (spec.assessmentFindings?.length) throw new Error('Assessment inputs require integration');
+    return;
+  }
+  const base = makePass(manifest, 'integration', manifest.units.map(unit => unit.id).sort(), null);
+  if (withFindings(base, spec.priorFindings, spec.assessmentFindings).id !== spec.id) throw new Error('Integration input hash mismatch');
+  const readable = new Set(describeBundle(manifest, spec.unitIds, null).sourceMap.map(entry => entry.path.bytesBase64));
+  if (spec.assessmentFindings?.some(finding => !finding.location.path || !readable.has(finding.location.path.bytesBase64)))
+    throw new Error('Assessment source unavailable');
 }

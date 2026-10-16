@@ -25,10 +25,10 @@ export function createScheduler(options: SchedulerOptions) {
   let active: { claim: ClaimedAttempt; controller: AbortController } | null = null;
   let blocked = false;
 
-  async function cancelPull(repositoryId: string, pullNumber: number, reason: CancellationReason): Promise<void> {
+  async function cancelPull(repositoryId: string, pullNumber: number, reason: CancellationReason, live?: LivePull): Promise<void> {
     const current = store.current(repositoryId, pullNumber), observed = store.observation(repositoryId, pullNumber);
     if (observed.blockedReason !== reason || current?.state !== 'superseded') {
-      store.invalidatePull(repositoryId, pullNumber, observed.generation, reason, current?.identity.headSha ?? null, current?.identity.baseRef ?? null);
+      store.invalidatePull(repositoryId, pullNumber, observed.generation, reason, live?.headSha ?? current?.identity.headSha ?? null, live?.baseRef ?? current?.identity.baseRef ?? null, live);
     }
     if (active?.claim.identity.repositoryId === repositoryId && active.claim.identity.pullNumber === pullNumber) active.controller.abort();
   }
@@ -88,7 +88,7 @@ export function createScheduler(options: SchedulerOptions) {
       else if (policy.skipLabels.some(label => pull.labels.includes(label))) reason = 'skipped';
       else if (pull.author.type !== 'User' && !policy.allowBotAuthors) reason = 'bot_author';
       else if (snapshot.trusted.policyHash !== identity.policyHash || worker.runtimeHash !== identity.runtimeHash) reason = 'policy_changed';
-      if (reason) { await cancelPull(identity.repositoryId, identity.pullNumber, reason); signal.throwIfAborted(); }
+      if (reason) { await cancelPull(identity.repositoryId, identity.pullNumber, reason, reason === 'access_revoked' ? undefined : pull); signal.throwIfAborted(); }
       return snapshot.trusted;
     }
     async function guard(): Promise<void> {

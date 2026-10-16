@@ -4,7 +4,7 @@ import { createAdmissionService } from '../src/events.js';
 import { loadPolicy } from '../src/policy.js';
 import { openStore } from '../src/store.js';
 import { GitHubAccessError } from '../src/github.js';
-import type { GitHubPort } from '../src/github.js';
+import type { AdmissionGitHubPort } from '../src/github.js';
 import type { LivePull, RepoPolicy, Store } from '../src/contracts.js';
 
 const secret = 'synthetic-webhook-secret';
@@ -20,7 +20,7 @@ const pull: LivePull = {
   baseRef: 'main', baseSha: 'b'.repeat(40), mergeBaseSha: 'c'.repeat(40),
   draft: false, state: 'open', labels: [], author: { login: 'author', type: 'User' },
 };
-class FakeGitHub implements GitHubPort {
+class FakeGitHub implements AdmissionGitHubPort {
   live = structuredClone(pull);
   calls: string[] = [];
   permission = 'write';
@@ -229,6 +229,7 @@ describe('signed, durable event admission', () => {
     const result = await send(service, payload(), 'pull_request', 'bad-config');
     expect(result.kind).toBe('configuration_failure');
     expect(store.receipt('bad-config')).toMatchObject({ kind: 'configuration_failure' });
+    expect(store.publicationNotices()).toMatchObject([{ kind: 'configuration_failure', reviewedIdentity: null, target: { installationId: '100', repositoryId: '200', pullNumber: 42 } }]);
     expect(store.claim(Date.now())).toBeNull();
   });
   it('rereads live identity and policy after stale observation rather than retrying old snapshots', async () => {

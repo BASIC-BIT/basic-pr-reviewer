@@ -1,3 +1,4 @@
+import { validateIntegrationInputs } from './passes.js';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
@@ -488,6 +489,7 @@ process.stdin.on('end', () => {
   async function materializePass(manifest: Manifest, input: PlannedPass, signal?: AbortSignal) {
     const planned = plannedPassSchema.parse(input);
     const snapshot = captured(manifest);
+    validateIntegrationInputs(manifest, planned);
     if (planned.kind === 'integration' && (planned.groupId !== null || planned.unitIds.length !== manifest.units.length)) {
       throw new Error('Integration must include the full comparison');
     }

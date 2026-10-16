@@ -19,6 +19,30 @@ const entries = [
 ];
 
 describe('trusted coverage planning', { timeout: 120000 }, () => {
+  it('assesses a retained finding on changed scope in the existing current integration', async () => {
+    const f = await fixture([], entries), p = policy(), { source } = await service(f);
+    const first = await source.captureManifest(identity(f, p), p);
+    const scope = planCoverage(first, [], await source.verifyAncestry(first, [])).freshPasses.find(pass => pass.kind === 'scope')!;
+    const old = record(first, scope);
+    old.outcome.findings[0]!.location = { kind: 'summary', path: first.units.find(unit => unit.id === scope.unitIds[0])!.path };
+    const head = f.commit([{ ...entries[0]!, text: 'fixed\n' }, entries[1]!], f.head);
+    const current = await source.captureManifest({ ...identity(f, p), headSha: head, generation: 2, attemptId: '9' }, p);
+    const proof = await source.verifyAncestry(current, [f.head]);
+    const fresh = planCoverage(current, [old], proof).freshPasses.filter(pass => pass.kind === 'scope').map(pass => {
+      const row = record(current, pass); row.outcome.findings = []; return row;
+    });
+    const integration = planCoverage(current, [old, ...fresh], proof).freshPasses.find(pass => pass.kind === 'integration')!;
+    expect(integration.assessmentFindings).toEqual(old.outcome.findings);
+    const runnable = await source.materializePass(current, integration);
+    expect(runnable.spec.assessmentFindings).toEqual(old.outcome.findings);
+    await expect(source.materializePass(current, { ...integration, assessmentFindings: [] })).rejects.toThrow(/input hash/);
+    const completed = record(current, integration); completed.outcome.findings = [];
+    completed.outcome.priorFindingAssessments = [{ findingId: old.outcome.findings[0]!.id, assessment: 'fixed' }];
+    const result = aggregateReview(current.identity, current, [...fresh, completed]);
+    expect(result.complete).toBe(true); expect(result.findings).toEqual([]);
+    expect(result.priorFindingAssessments).toEqual(completed.outcome.priorFindingAssessments);
+    expect(result.coveredUnitIds).not.toContain(scope.unitIds[0]);
+  });
   it('materializes only captured trusted instruction content, independent of caller mutation', async () => {
     const neighbor = { path: 'private/context.ts', text: 'context must stay excluded' };
     const f = await fixture([neighbor], [...entries, neighbor]);

@@ -2,10 +2,10 @@ import { Octokit } from '@octokit/core';
 import { createAppAuth } from '@octokit/auth-app';
 import { z } from 'zod';
 import { livePullSchema } from './contracts.js';
-import type { LivePull, ReviewIdentity } from './contracts.js';
+import type { LivePull, ReviewIdentity, PublicationTarget } from './contracts.js';
 
 export type InstalledRepository = { installationId: string; repositoryId: string };
-export interface GitHubPort {
+export interface AdmissionGitHubPort {
   assertInstallation(installationId: string): Promise<{ ownerId: string }>;
   listInstallations(): Promise<string[]>;
   readLivePull(installationId: string, repositoryId: string, pullNumber: number): Promise<LivePull>;
@@ -15,6 +15,21 @@ export interface GitHubPort {
   listRepositories(installationId: string): Promise<InstalledRepository[]>;
   listOpenPulls(installationId: string, repositoryId: string): Promise<number[]>;
 }
+export type OwnedPublication = { id: string; channel: 'summary' | 'check' | 'inline'; body: string; headSha: string | null };
+export type ReviewThread = { id: string; reviewId: string; body: string; owned: boolean; resolved: boolean; hasReplies: boolean };
+export type CheckPublication = { headSha: string; body: string; status: 'queued' | 'in_progress' | 'completed'; conclusion: 'success' | 'neutral' | 'cancelled' | null };
+export type InlineComment = { path: string; side: 'LEFT' | 'RIGHT'; line: number; start_line?: number; start_side?: 'LEFT' | 'RIGHT'; body: string };
+export interface PublicationGitHubPort {
+  readLivePull(installationId: string, repositoryId: string, pullNumber: number): Promise<LivePull>;
+  listOwnedPublications(target: PublicationTarget): Promise<OwnedPublication[]>;
+  upsertSummary(target: PublicationTarget, id: string | null, body: string): Promise<string>;
+  upsertCheck(target: PublicationTarget, id: string | null, check: CheckPublication): Promise<string>;
+  createReview(target: PublicationTarget, review: { commitId: string; body: string; comments: InlineComment[] }): Promise<string>;
+  listThreads(target: PublicationTarget): Promise<ReviewThread[]>;
+  resolveThread(target: PublicationTarget, id: string): Promise<void>;
+  unresolveThread(target: PublicationTarget, id: string): Promise<void>;
+}
+export interface GitHubPort extends AdmissionGitHubPort, PublicationGitHubPort {}
 export interface GitCredentialPort {
   installationCredential(identity: Pick<ReviewIdentity, 'installationId' | 'repositoryId' | 'owner' | 'repo'>): Promise<string>;
 }
@@ -29,6 +44,10 @@ const apiPull = z.object({
   head: z.object({ sha, repo: z.object({ id: apiId }).nullable() }),
   base: z.object({ sha, ref: z.string().min(1), repo: z.object({ id: apiId }) }),
 });
+
+export class GitHubPermissionError extends Error {
+  constructor() { super('Publication permission unavailable; verify the intended App grants'); this.name = 'GitHubPermissionError'; }
+}
 
 export class GitHubAccessError extends Error {
   constructor(readonly installationId: string, readonly repositoryId: string | null, readonly status?: number) {
@@ -117,8 +136,98 @@ export function createGitHubAdapter(options: {
       if (rows.length < 100) return all;
     }
   }
+  let botId: string | undefined;
+  async function authorId(target: PublicationTarget): Promise<string> {
+    if (!botId) {
+      const info = z.object({ slug: z.string().min(1) }).parse((await app.request('GET /app')).data);
+      botId = z.object({ id: apiId }).parse(await request(target.installationId, target.repositoryId, 'GET /users/{username}', { username: `${info.slug}[bot]` })).id;
+    }
+    return botId;
+  }
+  async function publicationRequest(target: PublicationTarget, permission: 'pull_requests' | 'checks', route: string, parameters: Record<string, unknown>): Promise<unknown> {
+    await assertInstallation(target.installationId);
+    const repo = await readRepository(target.installationId, target.repositoryId);
+    if (repo.owner.login !== target.owner || repo.name !== target.repo) throw new GitHubAccessError(target.installationId, target.repositoryId);
+    try {
+      const auth = z.object({ token: z.string().min(1) }).parse(await client(target.installationId).auth({ type: 'installation',
+        repositoryIds: [Number(target.repositoryId)], permissions: { [permission]: 'write' } }));
+      const scoped = new Octokit({ auth: auth.token, request: { fetch: options.fetch ?? fetch } });
+      return (await scoped.request(route, route === 'POST /graphql' ? parameters : { owner: target.owner, repo: target.repo, ...parameters })).data;
+    } catch (error) {
+      if (error && typeof error === 'object' && 'status' in error && Number(error.status) === 403 && !rateLimited(error)) throw new GitHubPermissionError();
+      if (error && typeof error === 'object' && 'status' in error && [401, 404].includes(Number(error.status)) && !rateLimited(error))
+        throw new GitHubAccessError(target.installationId, target.repositoryId, Number(error.status));
+      throw requestError(error);
+    }
+  }
+  async function threadMutation(target: PublicationTarget, id: string, action: 'resolveReviewThread' | 'unresolveReviewThread'): Promise<void> {
+    const result = z.object({ errors: z.array(z.unknown()).optional(), data: z.record(z.string(), z.unknown()).optional() }).parse(
+      await publicationRequest(target, 'pull_requests', 'POST /graphql', {
+        query: `mutation($id:ID!){${action}(input:{threadId:$id}){thread{id isResolved}}}`, variables: { id },
+      }));
+    if (result.errors?.length || !result.data?.[action]) throw new Error('Thread mutation unavailable with current permissions');
+  }
   return {
     assertInstallation,
+    async listOwnedPublications(target) {
+      const author = await authorId(target), args = { owner: target.owner, repo: target.repo };
+      const result: OwnedPublication[] = [];
+      for (const item of await pages(target.installationId, target.repositoryId, 'GET /repos/{owner}/{repo}/issues/{issue_number}/comments', { ...args, issue_number: target.pullNumber }, null)) {
+        const row = z.object({ id: apiId, body: z.string(), user: z.object({ id: apiId }), performed_via_github_app: z.object({ id: apiId }).nullable().optional() }).parse(item);
+        if (row.user.id === author && row.performed_via_github_app?.id === options.appId) result.push({ id: row.id, body: row.body, channel: 'summary', headSha: null });
+      }
+      for (const item of await pages(target.installationId, target.repositoryId, 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', { ...args, pull_number: target.pullNumber }, null)) {
+        const row = z.object({ id: apiId, body: z.string().nullable(), user: z.object({ id: apiId }), commit_id: sha }).parse(item);
+        if (row.user.id === author) result.push({ id: row.id, body: row.body ?? '', channel: 'inline', headSha: row.commit_id });
+      }
+      for (const item of await pages(target.installationId, target.repositoryId, 'GET /repos/{owner}/{repo}/commits/{ref}/check-runs', { ...args, ref: target.headSha, filter: 'all' }, 'check_runs')) {
+        const row = z.object({ id: apiId, app: z.object({ id: apiId }), head_sha: sha, output: z.object({ summary: z.string().nullable() }) }).parse(item);
+        if (row.app.id === options.appId) result.push({ id: row.id, body: row.output.summary ?? '', channel: 'check', headSha: row.head_sha });
+      }
+      return result;
+    },
+    async upsertSummary(target, id, body) {
+      return z.object({ id: apiId }).parse(await publicationRequest(target, 'pull_requests', id === null
+        ? 'POST /repos/{owner}/{repo}/issues/{issue_number}/comments' : 'PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}',
+      { ...(id === null ? { issue_number: target.pullNumber } : { comment_id: id }), body })).id;
+    },
+    async upsertCheck(target, id, check) {
+      return z.object({ id: apiId }).parse(await publicationRequest(target, 'checks', id === null
+        ? 'POST /repos/{owner}/{repo}/check-runs' : 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}',
+      { ...(id === null ? { head_sha: check.headSha } : { check_run_id: id }), name: 'Subscription review',
+        status: check.status, ...(check.conclusion === null ? {} : { conclusion: check.conclusion }),
+        output: { title: 'Informational review coverage', summary: check.body } })).id;
+    },
+    async createReview(target, review) {
+      if (review.commitId !== target.headSha) throw new Error('Review commit mismatch');
+      return z.object({ id: apiId }).parse(await publicationRequest(target, 'pull_requests', 'POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews',
+        { pull_number: target.pullNumber, event: 'COMMENT', commit_id: target.headSha, body: review.body, comments: review.comments })).id;
+    },
+    async listThreads(target) {
+      const author = await authorId(target), result: ReviewThread[] = [];
+      let after: string | null = null;
+      for (;;) {
+        const response = z.object({ data: z.object({ repository: z.object({ pullRequest: z.object({ reviewThreads: z.object({
+          pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+          nodes: z.array(z.object({ id: z.string(), isResolved: z.boolean(), comments: z.object({ totalCount: z.number().int(),
+            nodes: z.array(z.object({ body: z.string(), author: z.object({ databaseId: apiId }).nullable(), pullRequestReview: z.object({ databaseId: apiId }).nullable() })) }) })),
+        }) }) }) }) }).parse(await publicationRequest(target, 'pull_requests', 'POST /graphql', {
+          query: 'query($owner:String!,$repo:String!,$number:Int!,$after:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:1){totalCount nodes{body author{... on Bot{databaseId} ... on User{databaseId}} pullRequestReview{databaseId}}}}}}}}',
+          variables: { owner: target.owner, repo: target.repo, number: target.pullNumber, after },
+        }));
+        const page = response.data.repository.pullRequest.reviewThreads;
+        for (const thread of page.nodes) {
+          const root = thread.comments.nodes[0]; if (!root?.pullRequestReview) continue;
+          result.push({ id: thread.id, reviewId: root.pullRequestReview.databaseId, body: root.body, owned: root.author?.databaseId === author,
+            resolved: thread.isResolved, hasReplies: thread.comments.totalCount > 1 });
+        }
+        if (!page.pageInfo.hasNextPage) return result;
+        if (!page.pageInfo.endCursor || after === page.pageInfo.endCursor) throw new Error('Invalid thread pagination');
+        after = page.pageInfo.endCursor;
+      }
+    },
+    resolveThread: (target, id) => threadMutation(target, id, 'resolveReviewThread'),
+    unresolveThread: (target, id) => threadMutation(target, id, 'unresolveReviewThread'),
     async installationCredential(identity) {
       await assertInstallation(identity.installationId);
       const repo = await readRepository(identity.installationId, identity.repositoryId);

@@ -5,12 +5,24 @@ import { z } from 'zod';
 import {
   admittedEventSchema, attemptStateSchema, passOutcomeSchema, passSpecSchema, plannedPassSchema, validatePassOutcome,
   publicationIntentSchema, reviewIdentitySchema, timestampSchema,
-  webhookAdmissionSchema, leaseOwnershipSchema, reviewResultSchema,
+  webhookAdmissionSchema, leaseOwnershipSchema, reviewResultSchema, publicationTargetSchema, publicationNoticeSchema, publicationFenceSchema, publicationOperationSchema, livePullSchema,
 } from './contracts.js';
 import type {
   AttemptRecord, PassRecord, PublicationRecord, ReviewIdentity, Store,
-  PullObservation, LeaseOwnership, AttemptSettlement,
+  PullObservation, LeaseOwnership, AttemptSettlement, LivePull, PublicationFence, PublicationNotice, PublicationOperation,
 } from './contracts.js';
+
+const publicationTables = `CREATE TABLE publication_notices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, repository_id TEXT NOT NULL, pull_number INTEGER NOT NULL,
+  notice_json TEXT NOT NULL CHECK(json_valid(notice_json)),
+  FOREIGN KEY(repository_id, pull_number) REFERENCES pulls(repository_id, pull_number)
+) STRICT;
+CREATE TABLE publication_operations (
+  operation_key TEXT PRIMARY KEY, repository_id TEXT NOT NULL, pull_number INTEGER NOT NULL,
+  operation_json TEXT NOT NULL CHECK(json_valid(operation_json)),
+  FOREIGN KEY(repository_id, pull_number) REFERENCES pulls(repository_id, pull_number)
+) STRICT;
+PRAGMA user_version = 4;`;
 
 export const LEASE_DURATION_MS = 60 * 60 * 1_000;
 export const RECOVERY_WINDOW_MS = 48 * 60 * 60 * 1_000;
@@ -77,18 +89,18 @@ export function openStore(path: string): Store {
     db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     const { user_version: version } = z.object({ user_version: z.number().int() })
       .parse(db.prepare('PRAGMA user_version').get());
-    if (![0, 2, 3].includes(version)) throw new Error(`Unsupported schema version ${version}`);
+    if (![0, 2, 3, 4].includes(version)) throw new Error(`Unsupported schema version ${version}`);
     db.exec('PRAGMA journal_mode = WAL');
     if (version === 0) {
       transaction(() => {
         const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
         if (current.user_version === 0) db.exec(readFileSync(new URL('./schema.sql', import.meta.url), 'utf8'));
-        else if (current.user_version !== 3) throw new Error(`Unsupported schema version ${current.user_version}`);
+        else if (current.user_version !== 4) throw new Error(`Unsupported schema version ${current.user_version}`);
       });
     }
     if (version === 2) transaction(() => {
       const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
-      if (current.user_version === 3) return;
+      if (current.user_version === 3 || current.user_version === 4) return;
       db.exec(`ALTER TABLE attempts ADD COLUMN terminal_state TEXT CHECK (terminal_state IN ('complete', 'incomplete', 'intervention'));
         ALTER TABLE attempts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE attempts ADD COLUMN recovery_started_at INTEGER;
@@ -100,6 +112,10 @@ export function openStore(path: string): Store {
         CREATE TABLE pass_executions (attempt_id INTEGER NOT NULL REFERENCES attempts(id), pass_id TEXT NOT NULL,
           count INTEGER NOT NULL CHECK (count > 0), PRIMARY KEY (attempt_id, pass_id)) STRICT;
         PRAGMA user_version = 3;`);
+    });
+    transaction(() => {
+      const current = z.object({ user_version: z.number().int() }).parse(db.prepare('PRAGMA user_version').get());
+      if (current.user_version === 3) db.exec(publicationTables);
     });
   } catch (error) {
     db.close();
@@ -155,7 +171,7 @@ export function openStore(path: string): Store {
     return readPublication(db.prepare('SELECT * FROM publications WHERE id = ?').get(inserted.lastInsertRowid));
   }
 
-  function progress(identity: ReviewIdentity, settlement: AttemptSettlement, now: number): void {
+  function progress(identity: ReviewIdentity, settlement: Omit<AttemptSettlement, 'state'> & { state: AttemptSettlement['state'] | 'leased' }, now: number): void {
     const body = JSON.stringify({ state: settlement.state, reason: settlement.reason, nextAttemptAt: settlement.nextAttemptAt, result: settlement.result });
     const key = createHash('sha256').update(body).digest('hex');
     db.prepare('UPDATE attempts SET progress_sequence = progress_sequence + 1 WHERE id = ?').run(identity.attemptId);
@@ -195,6 +211,44 @@ export function openStore(path: string): Store {
       .run(now, repositoryId, pullNumber);
     db.prepare("UPDATE publications SET state = 'superseded', updated_at = ? WHERE attempt_id IN (SELECT id FROM attempts WHERE repository_id = ? AND pull_number = ?) AND state = 'planned'")
       .run(now, repositoryId, pullNumber);
+  }
+
+  function recordNotice(input: LivePull, expectedGeneration: number, kind: PublicationNotice['kind'], reason: string): PublicationNotice {
+    const pull = livePullSchema.parse(input), target = publicationTargetSchema.parse({ installationId: pull.installationId,
+      repositoryId: pull.repositoryId, owner: pull.owner, repo: pull.repo, pullNumber: pull.pullNumber,
+      headSha: pull.headSha, baseSha: pull.baseSha, baseRef: pull.baseRef, mergeBaseSha: pull.mergeBaseSha });
+    const observed = observation(pull.repositoryId, pull.pullNumber);
+    if (observed.generation !== expectedGeneration || observed.blockedReason !== reason) throw new StaleAdmissionObservationError();
+    const row = db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id WHERE p.repository_id = ? AND p.pull_number = ?').get(pull.repositoryId, pull.pullNumber);
+    const reviewedIdentity = row ? readAttempt(row).identity : null;
+    const inserted = db.prepare("INSERT INTO publication_notices(repository_id, pull_number, notice_json) VALUES (?, ?, '{}')").run(pull.repositoryId, pull.pullNumber);
+    const notice = publicationNoticeSchema.parse({ id: String(inserted.lastInsertRowid), target, generation: observed.generation, kind, reason, reviewedIdentity });
+    db.prepare('UPDATE publication_notices SET notice_json = ? WHERE id = ?').run(JSON.stringify(notice), notice.id);
+    return notice;
+  }
+  function fenceCurrent(input: PublicationFence): boolean {
+    const fence = publicationFenceSchema.parse(input);
+    if (fence.kind === 'review') {
+      const row = db.prepare('SELECT * FROM publications WHERE id = ?').get(fence.publicationId);
+      if (!row) return false;
+      const record = readPublication(row);
+      if (record.state !== 'planned') return false;
+      try { assertCurrent(record.intent.identity); } catch { return false; }
+      return accessAllowed(record.intent.identity.installationId, record.intent.identity.repositoryId);
+    }
+    const row = db.prepare('SELECT notice_json FROM publication_notices WHERE id = ?').get(fence.noticeId);
+    if (!row) return false;
+    const notice = publicationNoticeSchema.parse(JSON.parse(z.object({ notice_json: z.string() }).parse(row).notice_json));
+    const observed = observation(notice.target.repositoryId, notice.target.pullNumber);
+    return observed.generation === notice.generation && observed.blockedReason === notice.reason &&
+      accessAllowed(notice.target.installationId, notice.target.repositoryId);
+  }
+  function operation(key: string): PublicationOperation {
+    return publicationOperationSchema.parse(JSON.parse(z.object({ operation_json: z.string() }).parse(
+      db.prepare('SELECT operation_json FROM publication_operations WHERE operation_key = ?').get(key)).operation_json));
+  }
+  function saveOperation(value: PublicationOperation): void {
+    db.prepare('UPDATE publication_operations SET operation_json = ? WHERE operation_key = ?').run(JSON.stringify(value), value.key);
   }
 
   return {
@@ -241,6 +295,7 @@ export function openStore(path: string): Store {
           db.prepare('UPDATE pulls SET generation = ?, current_attempt_id = ?, updated_at = ?, rerun_sequence = ?, blocked_reason = NULL, observed_head_sha = ?, observed_base_ref = ? WHERE repository_id = ? AND pull_number = ?')
             .run(generation, id, now, event.trigger.kind === 'rerun' ? event.trigger.sequence : rerunSequence, event.identity.headSha, event.identity.baseRef, repositoryId, pullNumber);
           admitted = attempt(id);
+          progress(identity, { state: 'queued', reason: null, nextAttemptAt: event.receivedAt, result: null }, now);
           kind = 'created';
         }
         db.prepare('INSERT INTO deliveries (id, attempt_id, received_at, trigger_json) VALUES (?, ?, ?, ?)')
@@ -261,6 +316,7 @@ export function openStore(path: string): Store {
         const lease = { token: randomUUID(), expiresAt };
         db.prepare("UPDATE attempts SET state = 'leased', lease_token = ?, lease_expires_at = ?, updated_at = ?, recovery_started_at = COALESCE(recovery_started_at, ?) WHERE id = ?")
           .run(lease.token, expiresAt, now, now, record.identity.attemptId);
+        progress(record.identity, { state: 'leased', reason: null, nextAttemptAt: now, result: record.result }, now);
         return { ...record, recoveryStartedAt: record.recoveryStartedAt ?? now, state: 'leased', updatedAt: now, lease };
       });
     },
@@ -369,9 +425,14 @@ export function openStore(path: string): Store {
       return [...new Set(db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
         .map(readAttempt).map((record) => record.identity.installationId))];
     },
-    invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef) {
+    invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef, live) {
       timestampSchema.parse(expectedGeneration);
-      transaction(() => invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef));
+      transaction(() => {
+        if (live && (live.repositoryId !== repositoryId || live.pullNumber !== pullNumber || live.headSha !== headSha || live.baseRef !== baseRef)) throw new Error('Notice destination mismatch');
+        invalidatePull(repositoryId, pullNumber, expectedGeneration, reason, headSha, baseRef);
+        if (live) recordNotice(live, expectedGeneration + 1, reason === 'configuration_failure' ? 'configuration_failure'
+          : ['base_changed', 'retarget', 'publication_outdated', 'superseded', 'policy_changed'].includes(reason) ? 'outdated' : 'cancelled', reason);
+      });
     },
     setAccess(installationId, repositoryId, allowed) {
       transaction(() => {
@@ -407,6 +468,57 @@ export function openStore(path: string): Store {
     publications(repositoryId, pullNumber) {
       return db.prepare(`SELECT p.* FROM publications p JOIN attempts a ON a.id = p.attempt_id
         WHERE a.repository_id = ? AND a.pull_number = ? ORDER BY p.id`).all(repositoryId, pullNumber).map(readPublication);
+    },
+    publicationNotices(repositoryId, pullNumber) {
+      return db.prepare('SELECT notice_json FROM publication_notices ORDER BY id').all()
+        .map((row) => publicationNoticeSchema.parse(JSON.parse(z.object({ notice_json: z.string() }).parse(row).notice_json)))
+        .filter((notice) => (repositoryId === undefined || notice.target.repositoryId === repositoryId) && (pullNumber === undefined || notice.target.pullNumber === pullNumber));
+    },
+    recordNotice(input, expectedGeneration, kind, reason) {
+      return transaction(() => recordNotice(input, expectedGeneration, kind, reason));
+    },
+    publicationFenceCurrent: fenceCurrent,
+    planPublicationOperation(input) {
+      const candidate = publicationOperationSchema.parse({ ...input, state: 'planned', remoteId: null });
+      return transaction(() => {
+        if (!fenceCurrent(candidate.fence)) throw new StaleAdmissionObservationError();
+        const fence = candidate.fence;
+        const source = fence.kind === 'review' ? readPublication(db.prepare('SELECT * FROM publications WHERE id = ?').get(fence.publicationId)).intent.identity
+          : publicationNoticeSchema.parse(JSON.parse(z.object({ notice_json: z.string() }).parse(db.prepare('SELECT notice_json FROM publication_notices WHERE id = ?').get(fence.noticeId)).notice_json)).target;
+        const target = publicationTargetSchema.parse(Object.fromEntries(Object.entries(source).filter(([key]) => key in publicationTargetSchema.shape)));
+        if (JSON.stringify(target) !== JSON.stringify(candidate.target)) throw new Error('Publication target mismatch');
+        const existing = db.prepare('SELECT 1 FROM publication_operations WHERE operation_key = ?').get(candidate.key);
+        if (existing) {
+          const saved = operation(candidate.key);
+          if (JSON.stringify({ ...saved, state: 'planned', remoteId: null }) !== JSON.stringify(candidate)) throw new Error('Publication operation is immutable');
+          return saved;
+        }
+        db.prepare('INSERT INTO publication_operations VALUES (?, ?, ?, ?)').run(candidate.key, candidate.target.repositoryId, candidate.target.pullNumber, JSON.stringify(candidate));
+        return candidate;
+      });
+    },
+    publicationOperations(repositoryId, pullNumber) {
+      return db.prepare('SELECT operation_key FROM publication_operations WHERE repository_id = ? AND pull_number = ?').all(repositoryId, pullNumber)
+        .map((row) => operation(z.object({ operation_key: z.string() }).parse(row).operation_key));
+    },
+    markPublicationSending(key) {
+      transaction(() => { const saved = operation(key); if (!fenceCurrent(saved.fence)) throw new StaleAdmissionObservationError();
+        if (saved.state === 'planned') saveOperation({ ...saved, state: 'sending' }); });
+    },
+    planPublicationUndo(resolveKey) {
+      return transaction(() => {
+        const original = operation(resolveKey);
+        if (original.channel !== 'resolve' || original.state === 'planned') throw new Error('No resolution to undo');
+        const key = createHash('sha256').update(resolveKey + ':undo').digest('hex');
+        if (db.prepare('SELECT 1 FROM publication_operations WHERE operation_key = ?').get(key)) return operation(key);
+        const undo: PublicationOperation = { ...original, key, channel: 'unresolve', state: 'sending', remoteId: null };
+        db.prepare('INSERT INTO publication_operations VALUES (?, ?, ?, ?)').run(key, undo.target.repositoryId, undo.target.pullNumber, JSON.stringify(undo));
+        return undo;
+      });
+    },
+    acknowledgePublication(key, remoteId) {
+      z.string().min(1).parse(remoteId);
+      transaction(() => { const saved = operation(key); saveOperation({ ...saved, state: 'acknowledged', remoteId }); });
     },
     async backup(destination) {
       await backup(db, destination);

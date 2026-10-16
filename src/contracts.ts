@@ -159,6 +159,7 @@ export const plannedPassSchema = z.strictObject({
   unitIds: z.array(idSchema),
   contextHash: hashSchema,
   priorFindings: z.array(findingSchema),
+  assessmentFindings: z.array(findingSchema).optional(),
   // Defaults preserve readable legacy records, which cannot match a current scope hash.
   groupId: idSchema.nullable().default(null),
   scopeHash: hashSchema.default('0'.repeat(64)),
@@ -196,7 +197,7 @@ export type PassOutcome = z.infer<typeof passOutcomeSchema>;
 export function validatePassOutcome(spec: PlannedPass, input: PassOutcome): PassOutcome {
   const outcome = passOutcomeSchema.parse(input);
   if (spec.id !== outcome.passId) throw new Error('Pass ID mismatch');
-  const assigned = new Set(spec.unitIds), prior = new Set(spec.priorFindings.map((finding) => finding.id));
+  const assigned = new Set(spec.unitIds), prior = new Set([...spec.priorFindings, ...(spec.assessmentFindings ?? [])].map((finding) => finding.id));
   if (outcome.findings.some((finding) => finding.evidence.some((entry) => !assigned.has(entry.unitId)) ||
     finding.priorFindingId !== undefined && !prior.has(finding.priorFindingId))) throw new Error('Finding outside assigned pass scope');
   const assessed = outcome.priorFindingAssessments.map((item) => item.findingId);
@@ -246,6 +247,8 @@ export const reviewResultSchema = z.strictObject({
   status: z.enum(['complete', 'incomplete', 'skipped']), reason: z.literal('no_eligible_scope').nullable(),
   coveredUnitIds: z.array(hashSchema), reusedUnitIds: z.array(hashSchema), missingUnitIds: z.array(hashSchema),
   integrationStatus: z.enum(['pending', 'completed', 'failed', 'incomplete', 'not_required']),
+  reviewUnits: z.array(reviewUnitSchema).optional(),
+  priorFindingAssessments: z.array(z.strictObject({ findingId: idSchema, assessment: z.enum(['fixed', 'open', 'uncertain']) })).optional(),
   findings: z.array(findingSchema), exclusions: z.array(sourceOmissionSchema),
   missingScope: z.array(sourceOmissionSchema), failureCodes: z.array(idSchema),
   generation: sequenceSchema, publicationState: z.literal('unpublished'),
@@ -264,6 +267,27 @@ export type PublicationRecord = {
   updatedAt: number;
 };
 
+export const publicationTargetSchema = reviewInputSchema.omit({ policyHash: true, runtimeHash: true });
+export type PublicationTarget = z.infer<typeof publicationTargetSchema>;
+export const publicationNoticeSchema = z.strictObject({
+  id: githubIdSchema, target: publicationTargetSchema, generation: sequenceSchema,
+  kind: z.enum(['configuration_failure', 'outdated', 'cancelled']), reason: idSchema,
+  reviewedIdentity: reviewIdentitySchema.nullable(),
+});
+export type PublicationNotice = z.infer<typeof publicationNoticeSchema>;
+export const publicationFenceSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('review'), publicationId: githubIdSchema }),
+  z.strictObject({ kind: z.literal('notice'), noticeId: githubIdSchema }),
+]);
+export type PublicationFence = z.infer<typeof publicationFenceSchema>;
+export const publicationOperationSchema = z.strictObject({
+  key: hashSchema, fence: publicationFenceSchema, target: publicationTargetSchema,
+  channel: z.enum(['summary', 'check', 'inline', 'resolve', 'unresolve']), body: z.string(),
+  state: z.enum(['planned', 'sending', 'acknowledged']), remoteId: idSchema.nullable(),
+});
+export type PublicationOperation = z.infer<typeof publicationOperationSchema>;
+export type PublicationOutcome = { status: 'published' | 'pending' | 'stale' | 'access_revoked'; reason: string | null };
+
 export interface Store {
   admit(event: AdmittedEvent): Admission;
   claim(now: number): ClaimedAttempt | null;
@@ -279,7 +303,7 @@ export interface Store {
   trackedInstallations(): string[];
   observation(repositoryId: string, pullNumber: number): PullObservation;
   invalidatePull(repositoryId: string, pullNumber: number, expectedGeneration: number,
-    reason: string, headSha: string | null, baseRef: string | null): void;
+    reason: string, headSha: string | null, baseRef: string | null, live?: LivePull): void;
   accessGeneration(): number;
   accessAllowed(installationId: string, repositoryId: string): boolean;
   restoreAccess(installationId: string, repositoryId: string, expectedAccessGeneration: number): number;
@@ -288,6 +312,14 @@ export interface Store {
   acknowledge(deliveryId: string, admission: WebhookAdmission): void;
   planPublication(intent: PublicationIntent, owner: LeaseOwnership): PublicationRecord;
   publications(repositoryId: string, pullNumber: number): PublicationRecord[];
+  publicationNotices(repositoryId?: string, pullNumber?: number): PublicationNotice[];
+  recordNotice(pull: LivePull, expectedGeneration: number, kind: PublicationNotice['kind'], reason: string): PublicationNotice;
+  publicationFenceCurrent(fence: PublicationFence): boolean;
+  planPublicationOperation(operation: Omit<PublicationOperation, 'state' | 'remoteId'>): PublicationOperation;
+  publicationOperations(repositoryId: string, pullNumber: number): PublicationOperation[];
+  markPublicationSending(key: string): void;
+  acknowledgePublication(key: string, remoteId: string): void;
+  planPublicationUndo(resolveKey: string): PublicationOperation;
   backup(path: string): Promise<void>;
   close(): void;
 }
