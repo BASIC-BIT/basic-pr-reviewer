@@ -21,6 +21,7 @@ export type ServiceComponents = {
 export type ServiceConfig = {
   stateDirectory: string; controlSocket: string; port: number;
   acquireOwnership: () => Promise<() => Promise<void>>;
+  pause: { read: () => Promise<boolean>; write: (paused: boolean) => Promise<void> };
   open: () => Promise<ServiceComponents>;
   heartbeat: (health: ServiceHealth) => Promise<void>;
   now?: () => number; tickMs?: number; minimumFreeBytes?: number;
@@ -55,11 +56,14 @@ export async function startService(config: ServiceConfig) {
   const now = config.now ?? Date.now;
   let stopping = false, paused = false, timer: ReturnType<typeof setTimeout> | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined, heartbeatWork: Promise<void> | null = null;
+  let pauseChange: Promise<void> = Promise.resolve();
   let activeCycle: Promise<void> | null = null, lastCycleAt = now(), lastReconcile = now(), lastPurge = 0;
+  let pauseFailure = false;
   let reason: string | null = null, publicationFailures = 0, freeBytes = 0;
   const requests = new Set<Promise<void>>();
   const webhook = createServer(), control = createServer();
   try {
+    paused = await config.pause.read();
     components = await config.open();
     const { store, github, source, worker, backup, dailyBackup } = components;
     const owners = new Set(components.ownerIds);
@@ -87,10 +91,10 @@ export async function startService(config: ServiceConfig) {
       catch { database = false; }
       try { const disk = await statfs(config.stateDirectory); freeBytes = disk.bavail * disk.bsize; }
       catch { freeBytes = 0; }
-      const healthy = database && workerFailures === 0 && pending === 0 && publicationFailures === 0 && !scheduler.recoveryRequired && freeBytes >= (config.minimumFreeBytes ?? 512 * 1024 * 1024) && reason === null &&
+      const healthy = database && workerFailures === 0 && pending === 0 && publicationFailures === 0 && !pauseFailure && !scheduler.recoveryRequired && freeBytes >= (config.minimumFreeBytes ?? 512 * 1024 * 1024) && reason === null &&
         (activeCycle !== null || now() - lastCycleAt < Math.max(120000, (config.tickMs ?? 5000) * 3));
       return { healthy, database, scheduler: !stopping && !scheduler.recoveryRequired, paused, freeBytes,
-        workerFailures, publicationFailures: Math.max(publicationFailures, pending), recoveryRequired: scheduler.recoveryRequired, lastCycleAt, reason };
+        workerFailures, publicationFailures: Math.max(publicationFailures, pending), recoveryRequired: scheduler.recoveryRequired, lastCycleAt, reason: pauseFailure ? 'pause_state_failed' : reason };
     }
     async function beat(): Promise<void> {
       if (!heartbeatWork) heartbeatWork = health().then(config.heartbeat).catch(() => { reason = 'heartbeat_failed'; }).finally(() => { heartbeatWork = null; });
@@ -98,9 +102,15 @@ export async function startService(config: ServiceConfig) {
     }
     async function dispatch(): Promise<void> {
       for (const installation of store.trackedInstallations()) for (const pull of store.trackedPulls(installation)) {
-        for (const record of store.publications(pull.repositoryId, pull.pullNumber)) if (record.state === 'planned') await publisher.reconcilePublication(record);
+        for (const record of store.publications(pull.repositoryId, pull.pullNumber)) {
+          if (paused || stopping) return;
+          if (record.state === 'planned') await publisher.reconcilePublication(record);
+        }
       }
-      for (const notice of store.publicationNotices()) if (store.publicationFenceCurrent({ kind: 'notice', noticeId: notice.id })) await publisher.reconcileNotice(notice);
+      for (const notice of store.publicationNotices()) {
+        if (paused || stopping) return;
+        if (store.publicationFenceCurrent({ kind: 'notice', noticeId: notice.id })) await publisher.reconcileNotice(notice);
+      }
     }
     // Ownership precedes all cleanup, and live reconciliation precedes any publication.
     await scheduler.recoverWorker();
@@ -118,7 +128,7 @@ export async function startService(config: ServiceConfig) {
           if (now() - lastReconcile >= RECONCILIATION_INTERVAL_MS) { await admission.reconcileInstalled(); lastReconcile = now(); }
           if (scheduler.recoveryRequired) await scheduler.recoverWorker();
           if (!paused && !stopping) await scheduler.tick(now());
-          if (!stopping) await dispatch();
+          if (!paused && !stopping) await dispatch();
         } catch { reason ??= 'service_cycle_failed'; }
         finally {
           lastCycleAt = now();
@@ -128,6 +138,17 @@ export async function startService(config: ServiceConfig) {
       activeCycle = work();
       try { await activeCycle; } finally { activeCycle = null; }
     }
+    function changePause(value: boolean): Promise<void> {
+      const work = pauseChange.then(async () => {
+        if (value) paused = true;
+        try { await config.pause.write(value); }
+        catch (error) { paused = true; pauseFailure = true; if (activeCycle) await activeCycle; throw error; }
+        if (value && activeCycle) await activeCycle;
+        paused = value; pauseFailure = false;
+      });
+      pauseChange = work.catch(() => {});
+      return work;
+    }
     async function command(input: unknown): Promise<unknown> {
       const parsed = commandSchema.parse(input);
       if (stopping) throw new Error('service_stopping');
@@ -135,8 +156,8 @@ export async function startService(config: ServiceConfig) {
         case 'inspect': return { observation: store.observation(parsed.repositoryId, parsed.pullNumber),
           current: store.current(parsed.repositoryId, parsed.pullNumber), notices: store.publicationNotices(parsed.repositoryId, parsed.pullNumber),
           operations: store.publicationOperations(parsed.repositoryId, parsed.pullNumber) };
-        case 'pause': paused = true; return { paused };
-        case 'resume': paused = false; return { paused };
+        case 'pause': await changePause(true); return { paused, drained: true };
+        case 'resume': await changePause(false); return { paused };
         case 'reconcile': await admission.reconcileInstalled(); return { reconciled: true };
         case 'backup': await backup(parsed.destination); return { backedUp: true };
       }

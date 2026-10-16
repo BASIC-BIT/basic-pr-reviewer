@@ -19,7 +19,8 @@ Set `REVIEWER_CONFIG` to a private JSON configuration file. Its default is `/etc
   "privateKey": {"secretId": "reviewer/app", "jsonKey": "privateKey"},
   "webhookSecret": {"secretId": "reviewer/app", "jsonKey": "webhookSecret"},
   "oauthToken": {"secretId": "shared/subscription", "jsonKey": "oauthToken"},
-  "port": 8787
+  "port": 8787,
+  "initiallyPaused": true
 }
 ```
 
@@ -49,7 +50,9 @@ reviewer resume
 reviewer backup /var/lib/basic-pr-reviewer/backups/operator-checkpoint.sqlite
 ```
 
-`inspect` returns the PR observation, current structured result, notices, and publication receipts. It can contain private findings and belongs in a trusted terminal. `pause` prevents new passes while the active pass finishes; intake and publication reconciliation continue. `resume` permits the next scheduled pass. `reconcile` refreshes live state without bypassing actor or policy restrictions. Backup destinations must be unused `.sqlite` filenames directly inside the configured backup directory.
+`inspect` returns the PR observation, current structured result, notices, and publication receipts. It can contain private findings and belongs in a trusted terminal. `pause` first persists the paused state and stops new inference and publication dispatch. It returns `{ "paused": true, "drained": true }` only after the active cycle has settled. Intake and lifecycle/access reconciliation continue. `resume` persists the enabled state before permitting inference and publication. A failed state write returns an error, keeps execution stopped, and reports `pause_state_failed` until a successful state change. Repair that failure before restarting or switching publishers. `reconcile` refreshes live state without bypassing actor or policy restrictions. Backup destinations must be unused `.sqlite` filenames directly inside the configured backup directory.
+
+`stateDirectory/pause.json` is a private mode 0600 boolean state file, atomically replaced and synced. Pause survives restart. When this file is absent, `initiallyPaused` defaults to true and initializes it before dependencies or startup reconciliation. Changing the configuration later does not override saved pause state. Use explicit `resume` after the deployment approval gate.
 
 Worker passes are scheduled serially every five seconds. Source or container cleanup failure blocks admission to inference and remains unhealthy until the owned cleanup succeeds. Publication runs after settlement without a worker lease. Lost or uncertain remote responses retain their sending receipts. Never delete a sending receipt to force a retry. Inspection and live App publication reconciliation must resolve the uncertainty.
 
@@ -61,7 +64,7 @@ The infrastructure must collect this heartbeat, alarm on a missing/stale heartbe
 
 ## Retention, backup and restore
 
-Open PR records remain indefinitely. The live GitHub closure timestamp starts a 30-day retention clock, with observation time as a conservative fallback when the timestamp is absent; reopening before expiry cancels that clock. Daily purge removes the pull, attempts, passes, delivery records, receipts, notices, and publication operations in one transaction. A purge error remains an operational failure. Source and worker allocations are temporary and are removed after every terminal path and during startup recovery.
+Open PR records remain indefinitely. The live GitHub closure timestamp starts a 30-day retention clock, with observation time as a conservative fallback when the timestamp is absent; reopening before expiry cancels that clock. Daily purge, and an expiry check before live admission or reconciliation, remove the pull, attempts, passes, delivery records, receipts, notices, and publication operations in one transaction. A purge error remains an operational failure. Source and worker allocations are temporary and are removed after every terminal path and during startup recovery.
 
 After expiry, a reopened PR starts with no saved coverage or findings. The publisher can adopt the surviving App-owned summary and recognize identical App findings. It does not turn GitHub thread text into coverage or authority to resolve an old thread. Ambiguous surviving publications require operator action.
 

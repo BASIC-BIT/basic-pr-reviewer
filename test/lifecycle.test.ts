@@ -16,13 +16,13 @@ import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 
 const running: RunningService[] = [];
 afterEach(async () => { for (const service of running.splice(0)) await service.stop(); });
-async function setup() {
+async function setup(initiallyPaused = false) {
   const remote = await fixture([], [{ path: 'src/index.ts', text: 'source-sentinel-private\n' }]);
   const root = await temp(), sourceRoot = join(root,'source'); await mkdir(sourceRoot);
   const live: LivePull = { installationId:'1',repositoryId:'2',ownerId:'4',owner:'synthetic',repo:'fixture',pullNumber:3,
     headRepositoryId:'2',baseRepositoryId:'2',headSha:remote.head,baseSha:remote.base,mergeBaseSha:remote.merge,baseRef:'main',
     draft:false,state:'open',labels:[],author:{login:'author',type:'User'} };
-  let now = Date.now(), ownedLock = false, revoked = false, loseResponse = false;
+  let now = Date.now(), ownedLock = false, revoked = false, loseResponse = false, pausedState = initiallyPaused, pauseWriteFails = false;
   const owned: OwnedPublication[] = [], threads: ReviewThread[] = [], calls: PassSpec[] = [], heartbeats: ServiceHealth[] = [];
   const repoPolicy = policy({ skipLabels:['skip-review'], rerunOnUnskip:true }).policy;
   let hook: ((signal: AbortSignal) => Promise<void>) | undefined;
@@ -45,6 +45,7 @@ async function setup() {
   const socket = process.platform==='win32'?`\\\\.\\pipe\\reviewer-${randomUUID()}`:join(root,'control.sock');
   async function start(tickMs = 3600000) {
     const service=await startService({stateDirectory:root,controlSocket:socket,port:0,now:()=>now,tickMs,minimumFreeBytes:0,
+      pause: { read: async()=>pausedState, write: async value=>{if(pauseWriteFails)throw new Error('synthetic disk failure');pausedState=value;} },
       acquireOwnership:async()=>{if(ownedLock)throw new Error('locked');ownedLock=true;return async()=>{ownedLock=false;};},
       heartbeat:async health=>{heartbeats.push(health);},
       open:async()=>{
@@ -71,7 +72,7 @@ async function setup() {
     const body=JSON.stringify(value),address=service.webhookAddress;if(!address||typeof address==='string')throw new Error('address');
     return fetch(`http://127.0.0.1:${address.port}/webhook`,{method:'POST',headers:{'x-github-event':'pull_request','x-github-delivery':delivery,'x-hub-signature-256':`sha256=${createHmac('sha256','synthetic-hook').update(body).digest('hex')}`},body});
   }
-  return {setHook:(next:typeof hook)=>{hook=next;},start,send,root,sourceRoot,socket,live,remote,owned,threads,calls,heartbeats,store:()=>store!,advance:(ms:number)=>{now+=ms;},setMode:(m:typeof mode)=>{mode=m;},lose:()=>{loseResponse=true;},revoke:()=>{revoked=true;},now:()=>now};
+  return {failPauseWrites:()=>{pauseWriteFails=true;},setHook:(next:typeof hook)=>{hook=next;},start,send,root,sourceRoot,socket,live,remote,owned,threads,calls,heartbeats,store:()=>store!,advance:(ms:number)=>{now+=ms;},setMode:(m:typeof mode)=>{mode=m;},lose:()=>{loseResponse=true;},revoke:()=>{revoked=true;},now:()=>now};
 }
 it('runs duplicate admission, partial retry preservation, integration recovery, restart, reuse and publication reconciliation', async()=>{
   const f=await setup();let service=await f.start();
@@ -118,7 +119,7 @@ it('handles base-only invalidation, skip/unskip, close/reopen, quota retry, purg
 it('exposes private controls, rejects lost-storage intake, and locks before opening dependencies',async()=>{
   const f=await setup();const service=await f.start();
   await expect(f.start()).rejects.toThrow('locked');
-  expect(await controlRequest(f.socket,{command:'pause'})).toEqual({paused:true});
+  expect(await controlRequest(f.socket,{command:'pause'})).toEqual({paused:true,drained:true});
   await f.send(service,'opened');await service.cycle();expect(f.calls).toHaveLength(0);
   await controlRequest(f.socket,{command:'resume'});await service.cycle();expect(f.calls).toHaveLength(1);
   await controlRequest(f.socket,{command:'backup',destination:join(f.root,'backups','operator.sqlite')});
@@ -171,4 +172,31 @@ it.each(['conflictingId','conflictingReference','partialFixed'] as const)('does 
   expect(result?.findings.some(finding=>finding.id==='synthetic-finding')).toBe(true);
   expect(retainedThread.resolved).toBe(false);expect(f.threads.every(thread=>!thread.resolved)).toBe(true);
   expect(result?.priorFindingAssessments?.some(assessment=>assessment.assessment==='fixed')).toBe(false);
+});
+
+it('expires a reopened PR before admission even when its daily purge has not run',async()=>{
+  const f=await setup();const service=await f.start();await f.send(service,'opened');await service.cycle();await service.cycle();
+  f.live.state='closed';await f.send(service,'closed');f.advance(30*86400000);
+  f.live.state='open';await f.send(service,'reopened');expect(f.store().current('2',3)?.passes).toEqual([]);
+  expect(f.store().passHistory('2',3)).toEqual([]);
+});
+it('keeps pause across restart, starts paused, and requires explicit resume for inference and publication',async()=>{
+  const f=await setup(true);let service=await f.start();await f.send(service,'opened');await service.cycle();
+  expect(f.calls).toHaveLength(0);expect(f.owned).toHaveLength(0);expect((await service.health()).paused).toBe(true);
+  await service.command({command:'resume'});await service.cycle();expect(f.calls).toHaveLength(1);
+  await service.command({command:'pause'});await service.stop();running.splice(running.indexOf(service),1);
+  service=await f.start();const publications=f.owned.length;await service.cycle();expect(f.calls).toHaveLength(1);expect(f.owned).toHaveLength(publications);
+  expect((await service.health()).paused).toBe(true);await service.command({command:'resume'});await service.cycle();expect(f.calls).toHaveLength(2);
+  f.failPauseWrites();await expect(service.command({command:'pause'})).rejects.toThrow();expect((await service.health()).paused).toBe(true);
+  await expect(service.command({command:'resume'})).rejects.toThrow();await service.cycle();expect(await service.health()).toMatchObject({paused:true,healthy:false,reason:'pause_state_failed'});
+});
+
+it('does not acknowledge pause until active inference has drained and prevents subsequent publication',async()=>{
+  const f=await setup();const service=await f.start();await f.send(service,'opened');
+  let entered:()=>void=()=>{},finish:()=>void=()=>{};
+  const started=new Promise<void>(resolve=>{entered=resolve;}),pending=new Promise<void>(resolve=>{finish=resolve;});
+  f.setHook(async()=>{entered();await pending;});const cycle=service.cycle();await started;
+  let drained=false;const pause=service.command({command:'pause'}).then(()=>{drained=true;});
+  await new Promise(resolve=>setImmediate(resolve));expect(drained).toBe(false);finish();await Promise.all([cycle,pause]);
+  expect(drained).toBe(true);expect(f.owned).toHaveLength(0);await service.cycle();expect(f.calls).toHaveLength(1);
 });

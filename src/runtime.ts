@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { request } from 'node:http';
-import { mkdir, readFile, realpath, lstat, stat, writeFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, realpath, lstat, stat, writeFile, rename, rm, open } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
@@ -20,7 +21,7 @@ export const runtimeConfigSchema = z.strictObject({
   stateDirectory: z.string().min(1), backupDirectory: z.string().min(1), releaseManifest: z.string().min(1),
   region: z.string().min(1), appId: z.string().regex(/^[1-9][0-9]*$/), ownerIds: z.array(z.string().regex(/^[1-9][0-9]*$/)).min(1),
   privateKey: reference, webhookSecret: reference, oauthToken: reference,
-  port: z.number().int().min(1).max(65535).default(8787),
+  port: z.number().int().min(1).max(65535).default(8787), initiallyPaused: z.boolean().default(true),
 });
 export class CredentialFailure extends Error {
   constructor(readonly credentialFailure: 'configuration' | 'temporary') { super(`credential_${credentialFailure}_failure`); }
@@ -68,6 +69,28 @@ export async function controlRequest(socketPath: string, command: OperatorComman
     req.on('error', reject); req.on('timeout', () => req.destroy(new Error('control_timeout'))); req.end(JSON.stringify(command));
   });
 }
+export function createPauseState(directory: string, initiallyPaused: boolean) {
+  const path = join(directory, 'pause.json');
+  async function write(paused: boolean): Promise<void> {
+    const temporary = join(directory, `pause-${randomUUID()}.pending`);
+    try {
+      await writeFile(temporary, JSON.stringify(paused) + '\n', { mode: 0o600, flag: 'wx', flush: true });
+      await rename(temporary, path);
+      if (process.platform === 'linux') { const dir = await open(directory, 'r'); try { await dir.sync(); } finally { await dir.close(); } }
+    } finally { await rm(temporary, { force: true }); }
+  }
+  async function read(): Promise<boolean> {
+    try {
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > 16 || process.platform === 'linux' && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) throw new Error('unsafe_pause_state');
+      return z.boolean().parse(JSON.parse(await readFile(path, 'utf8')));
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+      await write(initiallyPaused); return initiallyPaused;
+    }
+  }
+  return { read, write };
+}
 export async function runCli(args: string[]): Promise<void> {
   const config = runtimeConfigSchema.parse(JSON.parse(await readFile(process.env.REVIEWER_CONFIG ?? '/etc/basic-pr-reviewer/config.json', 'utf8')));
   const root = resolve(config.stateDirectory), socketPath = join(root, 'control.sock');
@@ -102,7 +125,7 @@ export async function runCli(args: string[]): Promise<void> {
     await rename(temporary, path);
   };
   try {
-    const service = await startService({ stateDirectory: root, controlSocket: socketPath, port: config.port, heartbeat,
+    const service = await startService({ stateDirectory: root, controlSocket: socketPath, port: config.port, heartbeat, pause: createPauseState(root, config.initiallyPaused),
       acquireOwnership: async () => { await assertFlock(lockPath); return async () => {}; },
       open: async () => {
         const release = await verifyRelease(engineRoot, resolve(config.releaseManifest));

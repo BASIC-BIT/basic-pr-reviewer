@@ -7,6 +7,7 @@ import { GitHubAccessError } from './github.js';
 import type { AdmissionGitHubPort } from './github.js';
 import { ConfigurationError, loadPolicy } from './policy.js';
 import { StaleAdmissionObservationError } from './store.js';
+import { createRetention } from './retention.js';
 
 export type WebhookHeaders = Record<string, string | undefined>;
 export const RECONCILIATION_INTERVAL_MS = 15 * 60 * 1000;
@@ -53,6 +54,7 @@ export function createAdmissionService(options: {
   }
 
   async function processPull(context: Context): Promise<WebhookAdmission> {
+    await createRetention({ store }).purgeExpired(now());
     for (let retry = 0; retry < 3; retry++) {
       // Observe before *both* live identity and policy reads. Revocation has its own clock.
       const observed = store.observation(context.repositoryId, context.pullNumber);
