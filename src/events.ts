@@ -55,13 +55,13 @@ export function createAdmissionService(options: {
     for (let retry = 0; retry < 3; retry++) {
       // Observe before *both* live identity and policy reads. Revocation has its own clock.
       const observed = store.observation(context.repositoryId, context.pullNumber);
-      const accessGeneration = store.accessGeneration();
+      let accessGeneration = store.accessGeneration();
       try {
-        if (!store.accessAllowed(context.installationId, context.repositoryId)) throw new Error('Installation access revoked');
         await verifyInstallation(context.installationId);
         const pull = livePullSchema.parse(await github.readLivePull(context.installationId, context.repositoryId, context.pullNumber));
         if (pull.installationId !== context.installationId || pull.repositoryId !== context.repositoryId || pull.pullNumber !== context.pullNumber) throw new Error('Live pull identity mismatch');
         if (!owners.has(pull.ownerId)) throw new GitHubAccessError(context.installationId, context.repositoryId);
+        accessGeneration = store.restoreAccess(context.installationId, context.repositoryId, accessGeneration);
         function cancel(reason: string): WebhookAdmission {
           if (store.accessGeneration() !== accessGeneration) throw new StaleAdmissionObservationError();
           store.invalidatePull(context.repositoryId, context.pullNumber, observed.generation, reason, pull.headSha, pull.baseRef);
@@ -254,21 +254,28 @@ export function createAdmissionService(options: {
     }
   }
   function retryAfter(error: unknown, now = Date.now()): number | null {
-    const parsed = z.object({ status: z.number(), response: z.object({ headers: z.record(z.string(), z.unknown()) }) }).safeParse(error);
+    const parsed = z.object({ status: z.number(), rateLimited: z.boolean().optional(),
+      response: z.object({ headers: z.record(z.string(), z.unknown()) }) }).safeParse(error);
     if (!parsed.success || ![403, 429].includes(parsed.data.status)) return null;
     const headers = parsed.data.response.headers;
     if (typeof headers['retry-after'] === 'string' && Number.isFinite(Number(headers['retry-after']))) return Math.max(1000, Number(headers['retry-after']) * 1000);
     if (headers['x-ratelimit-remaining'] === '0' && typeof headers['x-ratelimit-reset'] === 'string') return Math.max(1000, Number(headers['x-ratelimit-reset']) * 1000 - now);
-    return parsed.data.status === 429 ? 60_000 : null;
+    return parsed.data.status === 429 || parsed.data.rateLimited ? 60_000 : null;
   }
   // Startup and recurring execution stay serial. The host owns shutdown and the alarm.
   function startReconciliation(onError: (error: unknown) => void): () => void {
     let stopped = false;
+    let rateLimitFailures = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function run() {
       let delay = RECONCILIATION_INTERVAL_MS;
-      try { await reconcileInstalled(); }
-      catch (error) { onError(error); delay = retryAfter(error) ?? delay; }
+      try { await reconcileInstalled(); rateLimitFailures = 0; }
+      catch (error) {
+        onError(error);
+        const limited = retryAfter(error);
+        rateLimitFailures = limited === null ? 0 : Math.min(rateLimitFailures + 1, 5);
+        if (limited !== null) delay = Math.max(limited, Math.min(RECONCILIATION_INTERVAL_MS, 60_000 * 2 ** (rateLimitFailures - 1)));
+      }
       if (!stopped) { timer = setTimeout(() => { void run(); }, timestampSchema.parse(delay)); timer.unref(); }
     }
     void run();

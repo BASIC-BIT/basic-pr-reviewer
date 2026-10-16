@@ -1,6 +1,8 @@
-import { generateKeyPairSync } from 'node:crypto';
+import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { createGitHubAdapter, GitHubAccessError } from '../src/github.js';
+import { createAdmissionService } from '../src/events.js';
+import { openStore } from '../src/store.js';
 
 const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const head = 'a'.repeat(40), base = 'b'.repeat(40), merge = 'c'.repeat(40);
@@ -102,5 +104,27 @@ describe('Octokit installation adapter with synthetic HTTP transport', () => {
     const error: unknown = await github.assertInstallation('100').catch((error: unknown) => error);
     expect(error).toMatchObject({ status: 500 });
     expect(error).not.toHaveProperty('request');
+  });
+  it.each(['/app/installations/100', '/repositories/200'])('classifies secondary limits on %s with primary allowance and no retry header', async (limitedPath) => {
+    const { github } = setup((path) => path === limitedPath ? { status: 403,
+      data: { message: 'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.',
+        documentation_url: 'https://docs.github.com/rest/overview/rate-limits-for-the-rest-api#about-secondary-rate-limits' },
+      headers: { 'x-ratelimit-remaining': '100' } } : undefined);
+    const error: unknown = await github.readLivePull('100', '200', 42).catch((error: unknown) => error);
+    expect(error).not.toBeInstanceOf(GitHubAccessError);
+    expect(error).toMatchObject({ status: 403, rateLimited: true, response: { headers: { 'x-ratelimit-remaining': '100' } } });
+    expect(error).not.toHaveProperty('request');
+    expect(error).not.toHaveProperty('response.data');
+    const store = openStore(':memory:');
+    try {
+      const service = createAdmissionService({ store, github, webhookSecret: 'synthetic-secret', appId: '300', ownerIds: ['400'], runtimeHash: 'e'.repeat(64) });
+      const body = Buffer.from(JSON.stringify({ action: 'opened', installation: { id: 100 }, repository: { id: 200 },
+        sender: { login: 'human', type: 'User' }, number: 42, pull_request: { number: 42 } }));
+      const headers = { 'x-github-event': 'pull_request', 'x-github-delivery': 'secondary-limit',
+        'x-hub-signature-256': `sha256=${createHmac('sha256', 'synthetic-secret').update(body).digest('hex')}` };
+      await expect(service.admitWebhook(headers, body)).rejects.toMatchObject({ rateLimited: true });
+      expect(store.accessAllowed('100', '200')).toBe(true);
+      expect(store.receipt('secondary-limit')).toBeNull();
+    } finally { store.close(); }
   });
 });

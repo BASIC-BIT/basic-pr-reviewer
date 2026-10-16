@@ -284,7 +284,7 @@ describe('signed, durable event admission', () => {
     const read = github.readFile.bind(github);
     github.readFile = async (live, path) => {
       const value = await read(live, path);
-      if (path === 'AGENTS.md') store.setAccess('100', null, false);
+      if (path === 'AGENTS.md') { store.setAccess('100', null, false); github.revoked = true; }
       return value;
     };
     await expect(send(service, payload('synchronize'))).rejects.toThrow(/access revoked/i);
@@ -395,5 +395,92 @@ describe('signed, durable event admission', () => {
     await service.reconcileInstalled();
     expect(store.current('200', 42)?.state).toBe('superseded');
     expect(store.current('201', 42)?.state).toBe('queued');
+  });
+  it.each(['installation', 'installation_repositories'])('recovers missed %s restoration from live access without reviving the cancelled head', async (event) => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const previous = store.current('200', 42)?.identity;
+    await send(service, event === 'installation' ? payload('suspend') : payload('removed', { repositories_removed: [{ id: 200 }] }), event);
+    expect(store.accessAllowed('100', '200')).toBe(false);
+    const cancelledGeneration = store.observation('200', 42).generation;
+    // GitHub now reports active membership, but no restoration event was delivered.
+    await service.reconcileInstalled();
+    expect(store.accessAllowed('100', '200')).toBe(true);
+    expect(store.current('200', 42)).toMatchObject({ state: 'superseded', identity: previous });
+    expect(store.observation('200', 42).generation).toBe(cancelledGeneration);
+    expect(store.claim(Date.now())).toBeNull();
+    github.live.headSha = 'f'.repeat(40);
+    await service.reconcileInstalled();
+    expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { headSha: 'f'.repeat(40) } });
+  });
+  it('recovers a delayed removal delivery and admits a later head without another re-add event', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const removal = payload('removed', { repositories_removed: [{ id: 200 }] });
+    await send(service, removal, 'installation_repositories');
+    await send(service, payload('added', { repositories_added: [{ id: 200 }] }), 'installation_repositories');
+    github.live.headSha = 'f'.repeat(40);
+    await send(service, payload('synchronize'));
+    const previous = store.current('200', 42)?.identity;
+    await send(service, removal, 'installation_repositories');
+    await service.reconcilePull('200', 42);
+    expect(store.accessAllowed('100', '200')).toBe(true);
+    expect(store.current('200', 42)).toMatchObject({ state: 'superseded', identity: previous });
+    github.live.headSha = 'd'.repeat(40);
+    expect((await send(service, payload('synchronize'))).kind).toBe('admitted');
+  });
+  it('lets an authorized explicit rerun verify restored access without restoring the cancelled attempt', async () => {
+    const { store, service } = setup();
+    await send(service, payload());
+    const previous = store.current('200', 42)?.identity.attemptId;
+    await send(service, payload('suspend'), 'installation');
+    expect((await send(service, payload('created', { issue: { number: 42, pull_request: {} },
+      comment: { id: 600, body: '/claude-review rerun', user: { login: 'operator', type: 'User' } } }), 'issue_comment')).kind).toBe('admitted');
+    expect(store.current('200', 42)?.identity.attemptId).not.toBe(previous);
+    expect(store.current('200', 42)?.rerunSequence).toBe(1);
+  });
+  it('does not clear concurrent revocation using live metadata read before that revocation', async () => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    const read = github.readLivePull.bind(github);
+    github.readLivePull = async (installationId, repositoryId, pullNumber) => {
+      const snapshot = await read(installationId, repositoryId, pullNumber);
+      store.setAccess('100', null, false);
+      github.revoked = true;
+      return snapshot;
+    };
+    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access revoked/i);
+    expect(store.accessAllowed('100', '200')).toBe(false);
+    expect(store.current('200', 42)?.state).toBe('superseded');
+  });
+  it('backs off secondary limits without persisting revocation and returns to the regular cadence after success', async () => {
+    vi.useFakeTimers();
+    const { store, github, service } = setup();
+    let scans = 0;
+    github.listRepositories = async () => {
+      scans++;
+      if (scans <= 6) throw Object.assign(new Error('GitHub request failed'), { status: 403, rateLimited: true,
+        response: { headers: { 'x-ratelimit-remaining': '100' } } });
+      return [{ installationId: '100', repositoryId: '200' }];
+    };
+    const errors: unknown[] = [];
+    const stop = service.startReconciliation((error) => errors.push(error));
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scans).toBe(1);
+      expect(store.accessAllowed('100', '200')).toBe(true);
+      for (const expected of [
+        { delay: 60_000, scans: 2 }, { delay: 120_000, scans: 3 }, { delay: 240_000, scans: 4 },
+        { delay: 480_000, scans: 5 }, { delay: 900_000, scans: 6 }, { delay: 900_000, scans: 7 },
+      ]) {
+        await vi.advanceTimersByTimeAsync(expected.delay - 1);
+        expect(scans).toBe(expected.scans - 1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(scans).toBe(expected.scans);
+      }
+      expect(errors).toHaveLength(6);
+      await vi.advanceTimersByTimeAsync(900_000);
+      expect(scans).toBe(8);
+    } finally { stop(); vi.useRealTimers(); }
   });
 });

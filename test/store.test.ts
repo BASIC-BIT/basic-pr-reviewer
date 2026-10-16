@@ -248,4 +248,23 @@ describe('persistent review ledger', () => {
     expect(() => store.admit({ ...event, deliveryId: 'between-base-pushes', expectedGeneration: observed.generation,
       identity: { ...event.identity, baseSha: 'f'.repeat(40) } })).toThrow(StaleAdmissionObservationError);
   });
+  it('restores verified installation and repository access atomically without reviving cancelled attempts', () => {
+    const store = open();
+    store.admit(event);
+    store.setAccess('100', null, false);
+    store.setAccess('100', '200', false);
+    const generation = store.observation('200', 42).generation;
+    const accessGeneration = store.accessGeneration();
+    const concurrent = open();
+    concurrent.setAccess('100', '200', false);
+    expect(() => store.restoreAccess('100', '200', accessGeneration)).toThrow(StaleAdmissionObservationError);
+    expect(store.accessAllowed('100', '200')).toBe(false);
+    const cancelledGeneration = store.observation('200', 42).generation;
+    expect(cancelledGeneration).toBeGreaterThan(generation);
+    store.restoreAccess('100', '200', store.accessGeneration());
+    expect(store.accessAllowed('100', '200')).toBe(true);
+    expect(store.current('200', 42)?.state).toBe('superseded');
+    expect(store.observation('200', 42).generation).toBe(cancelledGeneration);
+    expect(store.claim(Date.now())).toBeNull();
+  });
 });

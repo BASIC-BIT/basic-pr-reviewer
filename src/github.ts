@@ -34,6 +34,7 @@ export class GitHubAccessError extends Error {
 }
 
 function rateLimited(error: object): boolean {
+  if ('message' in error && typeof error.message === 'string' && /secondary rate limit/i.test(error.message)) return true;
   if (!('response' in error)) return false;
   const response = z.object({ headers: z.record(z.string(), z.unknown()) }).safeParse(error.response);
   return response.success && (response.data.headers['x-ratelimit-remaining'] === '0' || Boolean(response.data.headers['retry-after']));
@@ -44,7 +45,8 @@ function requestError(error: unknown): Error {
     'retry-after': z.string().optional(), 'x-ratelimit-remaining': z.string().optional(), 'x-ratelimit-reset': z.string().optional(),
   }) }).optional() }).safeParse(error);
   return meta.success ? Object.assign(new Error('GitHub request failed'), {
-    status: meta.data.status, response: { headers: meta.data.response?.headers ?? {} },
+    status: meta.data.status, rateLimited: error !== null && typeof error === 'object' && rateLimited(error),
+    response: { headers: meta.data.response?.headers ?? {} },
   }) : new Error('GitHub request failed');
 }
 

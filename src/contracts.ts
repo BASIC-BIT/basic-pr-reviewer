@@ -182,6 +182,7 @@ export interface Store {
     reason: string, headSha: string | null, baseRef: string | null): void;
   accessGeneration(): number;
   accessAllowed(installationId: string, repositoryId: string): boolean;
+  restoreAccess(installationId: string, repositoryId: string, expectedAccessGeneration: number): number;
   setAccess(installationId: string, repositoryId: string | null, allowed: boolean): void;
   receipt(deliveryId: string): WebhookAdmission | null;
   acknowledge(deliveryId: string, admission: WebhookAdmission): void;

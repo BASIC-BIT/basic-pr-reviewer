@@ -235,6 +235,16 @@ export function openStore(path: string): Store {
       return { ...record, rerunSequence, passes };
     },
     observation, accessGeneration, accessAllowed,
+    restoreAccess(installationId, repositoryId, expectedAccessGeneration) {
+      timestampSchema.parse(expectedAccessGeneration);
+      return transaction(() => {
+        if (accessGeneration() !== expectedAccessGeneration) throw new StaleAdmissionObservationError();
+        const restored = db.prepare('DELETE FROM access_rules WHERE installation_id = ? AND repository_id IN (?, ?) AND allowed = 0')
+          .run(installationId, repositoryId, '*');
+        if (restored.changes > 0) db.prepare('UPDATE access_clock SET generation = generation + 1 WHERE id = 1').run();
+        return accessGeneration();
+      });
+    },
     trackedPulls(installationId) {
       return db.prepare('SELECT a.* FROM pulls p JOIN attempts a ON a.id = p.current_attempt_id').all()
         .map(readAttempt).filter((record) => record.identity.installationId === installationId)
