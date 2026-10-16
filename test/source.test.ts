@@ -6,6 +6,35 @@ import { fixture, policy, identity, service } from './fixtures/source.js';
 import type { Entry } from './fixtures/source.js';
 
 describe('immutable inert Git source', { timeout: 120000 }, () => {
+  it('keeps generic docs-only defaults when no custom patterns are supplied', async () => {
+    const paths = ['README.md', 'guide.mdx', 'reference.rst', 'notes.txt', 'docs/example.ts'];
+    const f = await fixture([], paths.map(path => ({ path, text: 'synthetic\n' })));
+    const p = policy({ excludeDocsOnly: true }), { source } = await service(f);
+    expect(p.policy.docsOnlyGlobs).toEqual(['**/*.md', '**/*.mdx', '**/*.rst', '**/*.txt', 'docs/**']);
+    const manifest = await source.captureManifest(identity(f, p), p);
+    expect(manifest.retrievalFailures).toEqual([]);
+    expect(manifest.units).toEqual([]);
+    expect(manifest.exclusions).toHaveLength(paths.length);
+  });
+  it.each([
+    { paths: ['docs/guide.md'], count: 0 },
+    { paths: ['README.md', 'AGENTS.md'], count: 2 },
+    { paths: ['docs/guide.md', 'src/code.ts'], count: 2 },
+  ])('limits docs-only exclusion to configured paths: $paths', async ({ paths, count }) => {
+    const f = await fixture([], paths.map(path => ({ path, text: 'synthetic\n' })));
+    const p = policy({ excludeDocsOnly: true, docsOnlyGlobs: ['docs/**'] }), { source } = await service(f);
+    const manifest = await source.captureManifest(identity(f, p), p);
+    expect(manifest.retrievalFailures).toEqual([]);
+    expect(manifest.units).toHaveLength(count);
+    expect(manifest.exclusions).toHaveLength(paths.length - count);
+  });
+  it('reviews a rename into docs when its old path is outside the docs-only scope', async () => {
+    const f = await fixture([{ path: 'README.md', text: 'synthetic\n' }], [{ path: 'docs/guide.md', text: 'synthetic\n' }]);
+    const p = policy({ excludeDocsOnly: true, docsOnlyGlobs: ['docs/**'] }), { source } = await service(f);
+    const manifest = await source.captureManifest(identity(f, p), p);
+    expect(manifest.units).toHaveLength(1);
+    expect(manifest.exclusions).toEqual([]);
+  });
   it('uses merge base, ignores export-ignore/attributes and creates stable byte-safe units', async () => {
     const f = await fixture([{ path: 'kept.txt', text: 'old\n' }], [
       { path: 'kept.txt', text: 'new\n' }, { path: '.gitattributes', text: '* export-ignore diff=hostile filter=hostile\n' },

@@ -28,8 +28,9 @@ Unknown fields, unsupported versions, unsafe instruction paths, missing required
 | `rerunOnUnskip` | `false` | Whether removing a skip label may start work |
 | `excludeGlobs` | `[]` | Scope exclusions consumed by source planning |
 | `excludeDocsOnly` | `false` | Documentation-only exclusion consumed by source planning |
+| `docsOnlyGlobs` | `["**/*.md", "**/*.mdx", "**/*.rst", "**/*.txt", "docs/**"]` | Paths counted as documentation when `excludeDocsOnly` is true. All old and new paths must match; mixed changes retain documentation coverage. |
 | `allowBotAuthors` | `false` | Whether PR authors may be bots |
-| `allowedBotActors` | `[]` | Bot logins allowed to trigger automatic work |
+| `allowedBotActors` | `[]` | Exact bot logins allowed to trigger automatic work. Literal `"*"` permits any bot actor. Bot-author policy and human write-permission checks for rerun commands still apply. |
 | `contextMode` | `"changed-context-only"` | `changed-context-only`, `diff`, or `allowlist`, enforced by source planning |
 | `contextAllowGlobs` | `[]` | Explicit additional context selection for source planning |
 | `githubLinksOnly` | `false` | Local publication restriction consumed by the renderer |

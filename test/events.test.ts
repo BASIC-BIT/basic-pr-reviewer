@@ -14,6 +14,7 @@ const policy: RepoPolicy = {
   rerunOnUnskip: false, excludeGlobs: [], excludeDocsOnly: false, allowBotAuthors: false,
   allowedBotActors: [], contextMode: 'diff', contextAllowGlobs: [], githubLinksOnly: true,
   instructionPaths: ['AGENTS.md'],
+  docsOnlyGlobs: ['**/*.md', '**/*.mdx', '**/*.rst', '**/*.txt', 'docs/**'],
 };
 const pull: LivePull = {
   installationId: '100', repositoryId: '200', ownerId: '400', headRepositoryId: '200', baseRepositoryId: '200',
@@ -176,8 +177,27 @@ describe('signed, durable event admission', () => {
     github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowBotAuthors: true, allowedBotActors: ['other-bot'] }));
     expect((await send(service, payload('synchronize', { sender: { login: 'other-bot', type: 'Bot' } }))).kind).toBe('admitted');
   });
-  it('requires exact human rerun commands and fresh write permission, deduplicating comment identity', async () => {
+  it.each([[[]], [['trusted-bot']], [['*']]])('preserves actor policy %j independently of bot authors', async (allowedBotActors) => {
+    const { github, service } = setup();
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowedBotActors }));
+    const event = payload('opened', { sender: { login: 'unlisted-bot', type: 'Bot' } });
+    expect(await send(service, event)).toMatchObject(allowedBotActors.includes('*')
+      ? { kind: 'admitted' } : { kind: 'cancelled', reason: 'bot_actor' });
+    github.live.author.type = 'Bot';
+    expect(await send(service, event)).toMatchObject({ kind: 'cancelled', reason: 'bot_author' });
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowedBotActors, allowBotAuthors: true }));
+    expect(await send(service, event)).toMatchObject(allowedBotActors.includes('*')
+      ? { kind: 'admitted' } : { kind: 'cancelled', reason: 'bot_actor' });
+  });
+  it('limits the wildcard to bot actors rather than other non-human types', async () => {
+    const { github, service } = setup();
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowedBotActors: ['*'] }));
+    expect(await send(service, payload('opened', { sender: { login: 'imported-user', type: 'Mannequin' } })))
+      .toMatchObject({ kind: 'cancelled', reason: 'bot_actor' });
+  });
+  it.each([[[]], [['*']]])('requires exact human rerun commands and fresh write permission with actor policy %j', async (allowedBotActors) => {
     const { store, github, service } = setup();
+    github.files.set('.github/claude-review.json', JSON.stringify({ ...policy, allowedBotActors }));
     await send(service, payload());
     const comment = (body: string, type = 'User') => payload('created', {
       issue: { number: 42, pull_request: {} }, comment: { id: 501, body, user: { login: 'operator', type } },

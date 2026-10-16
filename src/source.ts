@@ -376,7 +376,7 @@ process.stdin.on('end', () => {
       if (mergeBases.length !== 1 || mergeBases[0] !== identity.mergeBaseSha) throw new SourceError('comparison_mismatch');
       manifest.sourceMap = rawChanges(await git(directory, ['diff', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv',
         '--find-renames=100%', identity.mergeBaseSha, identity.headSha, '--'], undefined, signal));
-      const docGlobs = ['**/*.md', '**/*.mdx', '**/*.rst', '**/*.txt', 'docs/**'];
+      const docGlobs = policy.docsOnlyGlobs;
       const docsOnly = policy.excludeDocsOnly && manifest.sourceMap.length > 0 && manifest.sourceMap.every((item) => matches(item.path, docGlobs) && (!item.oldPath || matches(item.oldPath, docGlobs)));
       for (const item of manifest.sourceMap) if (docsOnly || excluded(item.path, policy.excludeGlobs) || (item.oldPath && excluded(item.oldPath, policy.excludeGlobs))) {
         item.disposition = 'excluded'; manifest.exclusions.push({ path: item.path, code: docsOnly ? 'docs_only' : 'policy_exclusion' });

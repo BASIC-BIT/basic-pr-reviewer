@@ -28,7 +28,7 @@ function ineligible(pull: LivePull, policy: RepoPolicy, actor: Actor | null): st
   if (!policy.baseBranches.includes(pull.baseRef)) return 'base_branch';
   if (policy.skipLabels.some((label) => pull.labels.includes(label))) return 'skipped';
   if (pull.author.type !== 'User' && !policy.allowBotAuthors) return 'bot_author';
-  if (actor && actor.type !== 'User' && !policy.allowedBotActors.includes(actor.login)) return 'bot_actor';
+  if (actor && actor.type !== 'User' && !(actor.type === 'Bot' && policy.allowedBotActors.includes('*')) && !policy.allowedBotActors.includes(actor.login)) return 'bot_actor';
   return null;
 }
 

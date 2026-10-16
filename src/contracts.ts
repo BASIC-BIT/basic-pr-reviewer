@@ -17,6 +17,7 @@ export const repoPolicySchema = z.strictObject({
   skipLabels: z.array(z.string().min(1)).default(['skip-review']),
   rerunOnUnskip: z.boolean().default(false), excludeGlobs: z.array(z.string()).default([]),
   excludeDocsOnly: z.boolean().default(false), allowBotAuthors: z.boolean().default(false),
+  docsOnlyGlobs: z.array(z.string()).default(['**/*.md', '**/*.mdx', '**/*.rst', '**/*.txt', 'docs/**']),
   allowedBotActors: z.array(z.string().min(1)).default([]),
   contextMode: z.enum(['diff', 'changed-context-only', 'allowlist']).default('changed-context-only'),
   contextAllowGlobs: z.array(z.string()).default([]), githubLinksOnly: z.boolean().default(false),
