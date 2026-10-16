@@ -26,7 +26,7 @@ async function setup() {
   const owned: OwnedPublication[] = [], threads: ReviewThread[] = [], calls: PassSpec[] = [], heartbeats: ServiceHealth[] = [];
   const repoPolicy = policy({ skipLabels:['skip-review'], rerunOnUnskip:true }).policy;
   let hook: ((signal: AbortSignal) => Promise<void>) | undefined;
-  let mode: 'success'|'partial'|'emptyFailure'|'integrationFailure'|'quota' = 'success';
+  let mode: 'success'|'partial'|'emptyFailure'|'integrationFailure'|'quota'|'fixed'|'conflictingId'|'conflictingReference'|'partialFixed' = 'success';
   const github: GitHubPort = {
     async assertInstallation() { if(revoked) throw new GitHubAccessError('1','2'); return {ownerId:'4'}; },
     async readDefaultBranch() { return 'main'; }, async listInstallations(){return ['1'];},
@@ -56,10 +56,11 @@ async function setup() {
           worker:{runtimeHash:'e'.repeat(64),reap:async()=>{expect(ownedLock).toBe(true);},runPass:async(_identity,spec,signal,guard)=>{
             await guard?.();signal.throwIfAborted();calls.push(spec);await hook?.(signal);
             const unit=spec.reviewUnits[0];
-            const findings=unit&&spec.kind==='scope'&&mode!=='emptyFailure'&&mode!=='quota'?[{id:'synthetic-finding',message:'Validate the return value.',severity:'P2' as const,
+            let findings: PassOutcome['findings']=unit&&spec.kind==='scope'&&mode!=='emptyFailure'&&mode!=='quota'?[{id:'synthetic-finding',message:'Validate the return value.',severity:'P2' as const,
               location:{kind:'line' as const,path:unit.path,side:'RIGHT' as const,startLine:1,endLine:1},evidence:[{unitId:unit.id,explanation:'Synthetic evidence.'}]}]:[];
-            const base={passId:spec.id,findings,priorFindingAssessments:[],model:{name:'synthetic',cliVersion:'fixture'},usage:{inputTokens:1,outputTokens:1}};
-            if(mode==='partial'||mode==='emptyFailure'||mode==='quota'||mode==='integrationFailure'&&spec.kind==='integration')return {...base,status:'failed',failureCode:mode==='quota'?'quota_exhausted':'provider_failure'} satisfies PassOutcome;
+            if (spec.kind === 'integration' && (mode === 'conflictingId' || mode === 'conflictingReference')) findings = spec.priorFindings.map(finding => ({ ...finding, ...(mode === 'conflictingReference' ? { id: 'conflicting-finding', priorFindingId: finding.id } : {}) }));
+            const base={passId:spec.id,findings,priorFindingAssessments:['fixed','conflictingId','conflictingReference','partialFixed'].includes(mode)&&spec.kind==='integration'?spec.priorFindings.map(finding=>({findingId:finding.id,assessment:'fixed' as const})):[],model:{name:'synthetic',cliVersion:'fixture'},usage:{inputTokens:1,outputTokens:1}};
+            if(mode==='partialFixed'&&spec.kind==='integration'||mode==='partial'||mode==='emptyFailure'||mode==='quota'||mode==='integrationFailure'&&spec.kind==='integration')return {...base,status:'failed',failureCode:mode==='quota'?'quota_exhausted':'provider_failure'} satisfies PassOutcome;
             return {...base,status:'completed',failureCode:null} satisfies PassOutcome;
           }} };
       }});
@@ -149,4 +150,25 @@ it('aborts an active timer-driven worker and cleans its source before releasing 
   await service.stop();running.splice(running.indexOf(service),1);expect(await readdir(f.sourceRoot)).toEqual([]);
   f.setHook(undefined);const restarted=await f.start();await restarted.cycle();await restarted.cycle();
   expect(f.store().current('2',3)?.result?.complete).toBe(true);
+});
+
+it('retires a retained partial finding only after current completed integration explicitly verifies its fix',async()=>{
+  const f=await setup();const service=await f.start();await f.send(service,'opened');
+  f.setMode('partial');await service.cycle();f.advance(70000);f.setMode('emptyFailure');await service.cycle();
+  f.advance(400000);f.setMode('success');await service.cycle();f.setMode('fixed');await service.cycle();
+  const current=f.store().current('2',3);
+  expect(current?.result?.complete).toBe(true);expect(current?.passes[0]?.outcome.findings).toHaveLength(1);
+  expect(current?.result?.findings).toEqual([]);expect(current?.result?.priorFindingAssessments).toContainEqual({findingId:'synthetic-finding',assessment:'fixed'});
+  expect(f.threads).toHaveLength(1);expect(f.threads[0]?.resolved).toBe(true);
+});
+
+it.each(['conflictingId','conflictingReference','partialFixed'] as const)('does not retire a finding from conflicting or incomplete integration: %s',async mode=>{
+  const f=await setup();const service=await f.start();await f.send(service,'opened');
+  f.setMode('partial');await service.cycle();f.advance(70000);f.setMode('emptyFailure');await service.cycle();
+  f.advance(400000);f.setMode('success');await service.cycle();
+  expect(f.threads).toHaveLength(1);const retainedThread=f.threads[0]!;f.setMode(mode);await service.cycle();
+  const result=f.store().current('2',3)?.result;
+  expect(result?.findings.some(finding=>finding.id==='synthetic-finding')).toBe(true);
+  expect(retainedThread.resolved).toBe(false);expect(f.threads.every(thread=>!thread.resolved)).toBe(true);
+  expect(result?.priorFindingAssessments?.some(assessment=>assessment.assessment==='fixed')).toBe(false);
 });

@@ -174,7 +174,8 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
       const readable = new Set(describeBundle(manifest, integration.unitIds, null).sourceMap.map(entry => entry.path.bytesBase64));
       priorFindingAssessments = current.outcome.priorFindingAssessments.map(assessment => {
         const finding = [...current.spec.priorFindings, ...(current.spec.assessmentFindings ?? [])].find(finding => finding.id === assessment.findingId);
-        return { ...assessment, assessment: finding?.location.path && readable.has(finding.location.path.bytesBase64) ? assessment.assessment : 'uncertain' };
+        const contradicted = current.outcome.findings.some(finding => finding.id === assessment.findingId || finding.priorFindingId === assessment.findingId);
+        return { ...assessment, assessment: finding?.location.path && readable.has(finding.location.path.bytesBase64) && !contradicted ? assessment.assessment : 'uncertain' };
       });
       if (integrationStatus === 'completed' && (current.spec.id !== expected.id || missing(integration.omissions).length > 0)) {
         integrationStatus = 'incomplete';
@@ -188,6 +189,7 @@ export function aggregateReview(identityInput: ReviewIdentity, input: Manifest, 
   const skipped = manifest.units.length === 0 && missingScope.length === 0;
   if (skipped) integrationStatus = 'not_required';
   const complete = missingUnitIds.length === 0 && missingScope.length === 0 && integrationStatus === 'completed';
+  if (complete) for (const assessment of priorFindingAssessments) if (assessment.assessment === 'fixed') findings.delete(assessment.findingId);
   return { identity, complete, status: skipped ? 'skipped' : complete ? 'complete' : 'incomplete', reason: skipped ? 'no_eligible_scope' : null,
     coveredUnitIds: [...covered].sort(), reusedUnitIds: [...reused].sort(), missingUnitIds,
     integrationStatus, reviewUnits: manifest.units, priorFindingAssessments: complete ? priorFindingAssessments : [], findings: [...findings.values()], exclusions: unique(exclusions), missingScope: unique(missingScope),
