@@ -124,7 +124,7 @@ describe('persistent review ledger', () => {
     firstStore.close();
     const reopened = open();
     expect(reopened.current('200', 42)).toMatchObject({
-      identity: admitted.identity, passes: [{ spec, outcome }],
+      identity: admitted.identity, passes: [{ spec: { id: spec.id, contextHash: spec.contextHash }, outcome }],
     });
     expect(reopened.admit(event)).toMatchObject({ kind: 'duplicate', identity: admitted.identity });
     reopened.savePass(admitted.identity, spec, outcome);
@@ -215,6 +215,28 @@ describe('persistent review ledger', () => {
       expect(() => store.savePass(admitted.identity, spec, invalid)).toThrow();
     }
     expect(store.current('200', 42)?.passes).toEqual([]);
+  });
+
+  it('retains identity-bound partial history without persisting temporary bundle paths', () => {
+    const store = open(), first = store.admit(event);
+    store.savePass(first.identity, spec, outcome);
+    store.savePass(first.identity, { ...spec, id: 'failed-scope' }, { ...outcome, passId: 'failed-scope', status: 'failed', failureCode: 'temporary' });
+    store.admit({ ...event, deliveryId: 'second-head', expectedGeneration: 1, identity: { ...event.identity, headSha: 'f'.repeat(40) } });
+    const history = store.passHistory('200', 42);
+    expect(history).toHaveLength(2);
+    expect(history.every((pass) => pass.identity.attemptId === first.identity.attemptId)).toBe(true);
+    expect(history.map((pass) => pass.outcome.status)).toEqual(['completed', 'failed']);
+    const db = new DatabaseSync(path);
+    expect(String(db.prepare('SELECT spec_json FROM passes LIMIT 1').get()?.spec_json)).not.toContain('bundles/synthetic');
+    db.close();
+    expect(store.passHistory('201', 42)).toEqual([]);
+  });
+
+  it('rejects otherwise valid findings whose evidence is outside the assigned units', () => {
+    const store = open(), admitted = store.admit(event);
+    const finding = outcome.findings[0]!;
+    expect(() => store.savePass(admitted.identity, spec, { ...outcome,
+      findings: [{ ...finding, evidence: [{ unitId: 'other-unit', explanation: 'Outside scope.' }] }] })).toThrow(/scope/i);
   });
 
   it('keeps hostile untrusted text in bound values', () => {

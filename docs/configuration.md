@@ -55,6 +55,30 @@ The caller must invoke `destroyWorkspace` for every successful bundle and its ca
 
 Source tests generate synthetic bare Git objects. The default transport has a real HTTPS fetch and a process-scoped Node credential helper. `REVIEWER_HOST_GIT_TEST=1 npm test -- test/source-transport.test.ts` also exercises Git's actual helper launch using synthetic credentials, without a network request. This opt-in is needed on Windows hosts whose sandbox blocks Git's MSYS subprocesses.
 
+## Pass planning and coverage
+
+`planCoverage(manifest, previous, ancestry)` plans from captured metadata without writing bundles. The manifest's `bundleInputs` contain aliases, original paths, unit mappings, hashes, byte sizes and selection roles. They contain no source bytes. `describeBundle` in `src/source.ts` owns selection and context hashing for both planning and materialization.
+
+Scope passes group conventional `packages`, `apps`, `modules` and `services` directories by package. `src`, `lib`, `test`, `tests` and `__tests__` pair nearby modules. Root files, shared contracts, configuration, uncertain paths and cross-group renames broaden invalidation to the whole comparison. This is a conservative directory rule, not dependency analysis. Current integration still checks cross-group effects.
+
+Each scope starts with at most 200 KiB of diff text, identified by `initialAliases` and `initialBytes`. All assigned units remain explicit. Full permitted source context stays navigable in the bundle. Scope navigation narrows the policy maximum to that group plus shared context. Integration receives the full permitted comparison and starts with at most 200 KiB of its diff text. A bundle resource omission remains missing scope even when a worker reports completion.
+
+Use these host-side operations in order:
+
+1. Read `store.passHistory(repositoryId, pullNumber)`. It includes failed and completed records with their original review identities.
+2. Call `source.verifyAncestry(manifest, heads, signal?)` with previous head SHAs and the current head SHA. It runs Git merge-base against captured objects. Missing or unrelated old heads cannot authorize reuse. The returned frozen proof is valid only in that process and for that head. Recompute it after restart; serialized data and model claims are not proofs.
+3. Call `planCoverage`. Its `reusedPasses` contain only compatible completed scope, projected to the current identity with `spec.reusedFrom` for older attempts. Persist adopted records with `savePass`. Current-attempt records retain their existing specifications. Failed scope is fresh. Base, merge base, policy, runtime and repository identity changes prevent reuse.
+4. Call `source.materializePass(manifest, plannedPass, signal?)` only for the next pass to execute. It checks the planned hash, omissions and initial aliases, writes one bundle and verifies captured bytes. It returns `{ spec, bundle }`. Only this runnable `PassSpec` has a real `bundlePath`; `PlannedPass` has none. Mount only `bundle.allowedReadScope`, read-only. Dispose the bundle in `finally`.
+5. Save the terminal, host-validated worker outcome. `validatePassOutcome` rejects foreign evidence units, unknown prior-finding references and worker-supplied coverage fields. The worker boundary must still validate execution success and source locations. These APIs do not turn arbitrary parsed model output into a trusted terminal outcome.
+6. Replan from saved outcomes before running integration. This supplies current scope findings, including useful findings from failed passes. Integration IDs bind the current comparison and finding inputs. An earlier integration result cannot certify later findings.
+7. Call `aggregateReview` with current stored records and any current projected reuse records. It derives coverage from validated assignments and terminal outcomes. Finish by disposing the capture workspace, including failed captures whose directory was already removed.
+
+`splitScope(manifest, plannedPass)` divides a multi-unit scope into two smaller passes. Their exact unit subsets remain reusable and count once toward coverage. A single unit returns no children; the execution layer must stop after its finite recovery limit. Recovered parent failures keep useful findings but do not block completion when their units are covered and current integration completes.
+
+`ReviewResult` separates covered units, reused units, missing units, missing context, exclusions and integration status. Binary and gitlink contents are excluded explicitly; their eligible metadata units do not certify their contents. Null-path `context_*` failures retain reviewed change units and findings but make the overall result incomplete. Empty or wholly policy-excluded comparisons produce `status: "skipped"`, `reason: "no_eligible_scope"`, no integration and no inference. Zero units caused by retrieval failure remain incomplete.
+
+The ledger keeps planned specifications and findings, without temporary bundle paths, captured diff/blob text or prompts. Legacy records without scope metadata remain readable but cannot qualify for current reuse. `publicationState: "unpublished"` is the aggregation result, not a claim about GitHub publication.
+
 ## Events and reruns
 
 Subscribe to `pull_request`, `push`, `issue_comment`, and `check_run`. Also process GitHub's automatically delivered `installation` and `installation_repositories` events.

@@ -106,17 +106,27 @@ export const reviewUnitSchema = z.strictObject({
 });
 export type ReviewUnit = z.infer<typeof reviewUnitSchema>;
 export const sourceOmissionSchema = z.strictObject({ path: pathIdentitySchema.nullable(), code: idSchema, unitIds: z.array(hashSchema).optional() });
-export const manifestSchema = z.strictObject({
-  identity: reviewIdentitySchema, units: z.array(reviewUnitSchema),
-  exclusions: z.array(sourceOmissionSchema), retrievalFailures: z.array(sourceOmissionSchema),
-  sourceMap: z.array(sourceMappingSchema), workspace: idSchema,
-});
-export type Manifest = z.infer<typeof manifestSchema>;
 export const bundleMappingSchema = z.strictObject({
   alias: z.string().regex(/^(data|quarantine)\/[0-9a-f]{64}\.(old|new|diff)\.txt$/),
   path: pathIdentitySchema, side: z.enum(['old', 'new', 'diff']), unitIds: z.array(hashSchema),
   contentHash: hashSchema,
 });
+export const bundleInputSchema = bundleMappingSchema.extend({
+  bytes: timestampSchema, role: z.enum(['diff', 'changed', 'context']),
+});
+export const manifestSchema = z.strictObject({
+  identity: reviewIdentitySchema, units: z.array(reviewUnitSchema),
+  exclusions: z.array(sourceOmissionSchema), retrievalFailures: z.array(sourceOmissionSchema),
+  sourceMap: z.array(sourceMappingSchema), workspace: idSchema,
+  bundleInputs: z.array(bundleInputSchema), bundleOmissions: z.array(sourceOmissionSchema),
+  maxBundleBytes: sequenceSchema,
+});
+export type Manifest = z.infer<typeof manifestSchema>;
+export const bundleDescriptorSchema = z.strictObject({
+  contextHash: hashSchema, sourceMap: z.array(bundleMappingSchema),
+  omissions: z.array(sourceOmissionSchema),
+});
+export type BundleDescriptor = z.infer<typeof bundleDescriptorSchema>;
 export const bundleSchema = z.strictObject({
   directory: idSchema, contextHash: hashSchema, sourceMap: z.array(bundleMappingSchema),
   omissions: z.array(sourceOmissionSchema), allowedReadScope: z.array(idSchema),
@@ -143,14 +153,22 @@ export const findingSchema = z.strictObject({
 });
 export type Finding = z.infer<typeof findingSchema>;
 
-export const passSpecSchema = z.strictObject({
+export const plannedPassSchema = z.strictObject({
   id: idSchema,
   kind: z.enum(['scope', 'integration']),
   unitIds: z.array(idSchema),
   contextHash: hashSchema,
-  bundlePath: idSchema,
   priorFindings: z.array(findingSchema),
+  // Defaults preserve readable legacy records, which cannot match a current scope hash.
+  groupId: idSchema.nullable().default(null),
+  scopeHash: hashSchema.default('0'.repeat(64)),
+  omissions: z.array(sourceOmissionSchema).default([]),
+  initialBytes: timestampSchema.max(200 * 1024).default(0),
+  initialAliases: z.array(idSchema).default([]),
+  reusedFrom: idSchema.nullable().default(null),
 }).refine((spec) => new Set(spec.unitIds).size === spec.unitIds.length, 'Duplicate unit IDs');
+export type PlannedPass = z.infer<typeof plannedPassSchema>;
+export const passSpecSchema = plannedPassSchema.safeExtend({ bundlePath: idSchema });
 export type PassSpec = z.infer<typeof passSpecSchema>;
 
 const passOutcomeBaseSchema = z.strictObject({
@@ -169,6 +187,17 @@ export const passOutcomeSchema = z.discriminatedUnion('status', [
 ]).refine((outcome) => new Set(outcome.findings.map((finding) => finding.id)).size === outcome.findings.length,
     'Duplicate finding IDs');
 export type PassOutcome = z.infer<typeof passOutcomeSchema>;
+
+export function validatePassOutcome(spec: PlannedPass, input: PassOutcome): PassOutcome {
+  const outcome = passOutcomeSchema.parse(input);
+  if (spec.id !== outcome.passId) throw new Error('Pass ID mismatch');
+  const assigned = new Set(spec.unitIds), prior = new Set(spec.priorFindings.map((finding) => finding.id));
+  if (outcome.findings.some((finding) => finding.evidence.some((entry) => !assigned.has(entry.unitId)) ||
+    finding.priorFindingId !== undefined && !prior.has(finding.priorFindingId))) throw new Error('Finding outside assigned pass scope');
+  const assessed = outcome.priorFindingAssessments.map((item) => item.findingId);
+  if (new Set(assessed).size !== assessed.length || assessed.some((id) => !prior.has(id))) throw new Error('Invalid prior finding assessment');
+  return outcome;
+}
 
 export const publicationIntentSchema = z.strictObject({
   identity: reviewIdentitySchema,
@@ -189,10 +218,25 @@ export type Admission = AttemptRecord & { kind: 'created' | 'duplicate' };
 export type ClaimedAttempt = AttemptRecord & { state: 'leased'; lease: Lease };
 export type PassRecord = {
   id: string;
-  spec: PassSpec;
+  identity: ReviewIdentity;
+  spec: PlannedPass;
   outcome: PassOutcome;
   createdAt: number;
   updatedAt: number;
+};
+export type Ancestry = Readonly<{ headSha: string; ancestorHeadShas: readonly string[] }>;
+export type CoveragePlan = {
+  freshPasses: PlannedPass[]; reusedPasses: PassRecord[];
+  reusedPassIds: string[]; invalidatedPassIds: string[]; uncoveredUnitIds: string[];
+};
+export type ReviewResult = {
+  identity: ReviewIdentity; complete: boolean;
+  status: 'complete' | 'incomplete' | 'skipped'; reason: 'no_eligible_scope' | null;
+  coveredUnitIds: string[]; reusedUnitIds: string[]; missingUnitIds: string[];
+  integrationStatus: 'pending' | 'completed' | 'failed' | 'incomplete' | 'not_required';
+  findings: Finding[]; exclusions: z.infer<typeof sourceOmissionSchema>[];
+  missingScope: z.infer<typeof sourceOmissionSchema>[]; failureCodes: string[];
+  generation: number; publicationState: 'unpublished';
 };
 export type PullRecord = AttemptRecord & { rerunSequence: number; passes: PassRecord[] };
 export type PublicationRecord = {
@@ -206,7 +250,8 @@ export type PublicationRecord = {
 export interface Store {
   admit(event: AdmittedEvent): Admission;
   claim(now: number): ClaimedAttempt | null;
-  savePass(identity: ReviewIdentity, spec: PassSpec, outcome: PassOutcome): void;
+  savePass(identity: ReviewIdentity, spec: PlannedPass | PassSpec, outcome: PassOutcome): void;
+  passHistory(repositoryId: string, pullNumber: number): PassRecord[];
   current(repositoryId: string, pullNumber: number): PullRecord | null;
   trackedPulls(installationId: string): { repositoryId: string; pullNumber: number }[];
   trackedInstallations(): string[];

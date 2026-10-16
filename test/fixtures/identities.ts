@@ -1,4 +1,5 @@
 import type { AdmittedEvent, PassOutcome, PassSpec } from '../../src/contracts.js';
+import { passSpecSchema } from '../../src/contracts.js';
 
 export const event: AdmittedEvent = {
   schemaVersion: 1,
@@ -13,10 +14,10 @@ export const event: AdmittedEvent = {
   },
 };
 
-export const spec: PassSpec = {
+export const spec: PassSpec = passSpecSchema.parse({
   id: 'scope-1', kind: 'scope', unitIds: ['unit-1'], contextHash: 'f'.repeat(64),
   bundlePath: 'bundles/synthetic', priorFindings: [],
-};
+});
 
 export const outcome: PassOutcome = {
   passId: spec.id, status: 'completed', findings: [{

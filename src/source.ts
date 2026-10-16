@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, posix, resolve } from 'node:path';
 import { z } from 'zod';
-import { bundleSchema, manifestSchema, repoPolicySchema, reviewIdentitySchema } from './contracts.js';
-import type { Bundle, Manifest, PathIdentity, ReviewIdentity, ReviewUnit, TrustedPolicy } from './contracts.js';
+import { bundleSchema, manifestSchema, plannedPassSchema, repoPolicySchema, reviewIdentitySchema } from './contracts.js';
+import type { Ancestry, Bundle, BundleDescriptor, Manifest, PathIdentity, PlannedPass, ReviewIdentity, ReviewUnit, TrustedPolicy } from './contracts.js';
 
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const objectId = (type: string, bytes: Buffer) => createHash('sha1').update(`${type} ${bytes.length}\0`).update(bytes).digest('hex');
@@ -25,13 +25,86 @@ type SourceOptions = {
   credential?: (identity: ReviewIdentity) => Promise<string>;
 };
 type Snapshot = { manifest: Manifest; policy: TrustedPolicy; blobs: Map<string, Buffer>;
-  patches: Map<string, Buffer>; context: { path: PathIdentity; blob: string; mode: string }[] };
+  patches: Map<string, Buffer>; files: Map<string, Buffer>; context: { path: PathIdentity; blob: string; mode: string }[] };
 class SourceError extends Error { constructor(readonly code: string) { super(code); } }
 function utf8(bytes: Buffer): string | null {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return null; }
 }
 const pathIdentity = (bytes: Buffer): PathIdentity => ({ bytesBase64: bytes.toString('base64') });
 const pathText = (path: PathIdentity) => utf8(Buffer.from(path.bytesBase64, 'base64'));
+const verifiedAncestry = new WeakSet<Ancestry>();
+export function assertVerifiedAncestry(ancestry: Ancestry, headSha: string): void {
+  if (!verifiedAncestry.has(ancestry) || ancestry.headSha !== headSha) throw new Error('Unverified or mismatched ancestry');
+}
+
+// shortcut: conventional directories only; extend for a verified convention, otherwise invalidate all groups.
+export function sourceGroup(path: PathIdentity): string {
+  const text = pathText(path);
+  if (!text || text.includes('\\')) return '@shared';
+  const parts = text.split('/');
+  if (parts.length < 2 || parts.some((part) => /^(shared|common|contracts?|types|config)(\.|$)/i.test(part))) return '@shared';
+  if (['packages', 'apps', 'modules', 'services'].includes(parts[0] ?? '') && parts.length > 2) return parts.slice(0, 2).join('/');
+  if (['src', 'lib', 'test', 'tests', '__tests__'].includes(parts[0] ?? '')) {
+    return `module/${(parts[1] ?? '').replace(/(?:\.(?:test|spec))?\.[^.]+$/, '')}`;
+  }
+  return '@shared';
+}
+
+function collectBundleInputs(snapshot: Snapshot): void {
+  const m = snapshot.manifest;
+  function add(path: PathIdentity, side: 'old' | 'new' | 'diff', bytes: Buffer, unitIds: string[], key: string, role: 'diff' | 'changed' | 'context') {
+    const alias = `${quarantine(path) ? 'quarantine' : 'data'}/${hash(key)}.${side}.txt`;
+    m.bundleInputs.push({ alias, path, side, unitIds: [...unitIds].sort(), contentHash: hash(bytes), bytes: bytes.length, role });
+    snapshot.files.set(alias, bytes);
+  }
+  for (const unit of m.units) {
+    const patch = snapshot.patches.get(unit.id);
+    if (!patch) throw new Error('Missing captured unit');
+    add(unit.path, 'diff', patch, [unit.id], unit.id, 'diff');
+    if (unit.kind === 'binary' || unit.kind === 'gitlink') m.bundleOmissions.push({ path: unit.path, code: `${unit.kind}_content`, unitIds: [unit.id] });
+  }
+  if (snapshot.policy.policy.contextMode === 'diff') return;
+  for (const mapping of m.sourceMap.filter((item) => item.disposition === 'review')) {
+    const ids = m.units.filter((unit) => unit.sourceId === mapping.id).map((unit) => unit.id);
+    for (const side of ['old', 'new'] as const) {
+      const blob = side === 'old' ? mapping.oldBlobId : mapping.newBlobId, mode = side === 'old' ? mapping.oldMode : mapping.newMode;
+      const path = side === 'old' ? mapping.oldPath ?? mapping.path : mapping.path;
+      if (!blob) continue;
+      const bytes = snapshot.blobs.get(blob);
+      if (mode === '160000') add(path, side, Buffer.from(`gitlink ${blob}\n`), ids, `${path.bytesBase64}:${blob}`, 'changed');
+      else if (bytes && !bytes.includes(0) && utf8(bytes) !== null) add(path, side, bytes, ids, `${path.bytesBase64}:${blob}`, 'changed');
+      else m.bundleOmissions.push({ path, code: 'binary_context', unitIds: ids });
+    }
+  }
+  for (const entry of snapshot.context) {
+    const bytes = snapshot.blobs.get(entry.blob);
+    if (bytes && !bytes.includes(0) && utf8(bytes) !== null) add(entry.path, 'new', bytes, [], `${entry.path.bytesBase64}:${entry.blob}`, 'context');
+    else if (bytes) m.bundleOmissions.push({ path: entry.path, code: 'binary_context' });
+  }
+}
+
+export function describeBundle(manifest: Manifest, unitIds: string[], groupId: string | null = null): BundleDescriptor {
+  const selected = new Set(unitIds), known = new Set(manifest.units.map((unit) => unit.id));
+  if (selected.size !== unitIds.length || unitIds.some((id) => !known.has(id))) throw new Error('Unknown or duplicate review unit');
+  const inGroup = (path: PathIdentity) => groupId === null || sourceGroup(path) === '@shared' || sourceGroup(path) === groupId;
+  const relevant = (item: Manifest['retrievalFailures'][number]) => item.path === null || inGroup(item.path) || item.unitIds?.some((id) => selected.has(id));
+  const omissions = [...manifest.exclusions, ...manifest.retrievalFailures.filter(relevant),
+    ...manifest.bundleOmissions.filter((item) => item.unitIds ? item.unitIds.some((id) => selected.has(id)) : relevant(item))];
+  const files = new Map<string, Bundle['sourceMap'][number]>();
+  let bytes = 0;
+  for (const input of manifest.bundleInputs) {
+    const ids = input.unitIds.filter((id) => selected.has(id));
+    if (input.role === 'diff' ? ids.length === 0 : input.role === 'context' ? !inGroup(input.path) : ids.length === 0 && (groupId === null || !inGroup(input.path))) continue;
+    const existing = files.get(input.alias);
+    if (existing) { existing.unitIds = [...new Set([...existing.unitIds, ...ids])].sort(); continue; }
+    if (bytes + input.bytes > manifest.maxBundleBytes) { omissions.push({ path: input.path, code: 'bundle_limit', unitIds: ids }); continue; }
+    files.set(input.alias, { alias: input.alias, path: input.path, side: input.side, unitIds: ids.sort(), contentHash: input.contentHash });
+    bytes += input.bytes;
+  }
+  const sourceMap = [...files.values()].sort((a, b) => a.alias.localeCompare(b.alias));
+  const contextHash = hash(JSON.stringify({ policyHash: manifest.identity.policyHash, runtimeHash: manifest.identity.runtimeHash, files: sourceMap }));
+  return { contextHash, sourceMap, omissions };
+}
 function matches(path: PathIdentity, globs: string[]): boolean {
   const text = pathText(path);
   return text !== null && globs.some((glob) => posix.matchesGlob(text, glob));
@@ -219,8 +292,8 @@ process.stdin.on('end', () => {
     if (instructions.some((item, index) => item.hash !== trusted.instructions[index]?.hash) ||
       hash(JSON.stringify({ policy, instructions })) !== identity.policyHash || trusted.policyHash !== identity.policyHash) throw new Error('Trusted policy identity mismatch');
     const workspace = await mkdtemp(join(root, 'capture-')), directory = join(workspace, 'objects.git');
-    const manifest: Manifest = { identity, units: [], exclusions: [], retrievalFailures: [], sourceMap: [], workspace };
-    const snapshot: Snapshot = { manifest, policy: { ...trusted, policy }, blobs: new Map(), patches: new Map(), context: [] };
+    const manifest: Manifest = { identity, units: [], exclusions: [], retrievalFailures: [], sourceMap: [], workspace, bundleInputs: [], bundleOmissions: [], maxBundleBytes: limits.maxBundleBytes };
+    const snapshot: Snapshot = { manifest, policy: { ...trusted, policy }, blobs: new Map(), patches: new Map(), files: new Map(), context: [] };
     try {
       await git(directory, ['init', '--bare', '--template='], undefined, signal);
       await fetchObjects({ directory, identity, ...(signal ? { signal } : {}) });
@@ -321,67 +394,74 @@ process.stdin.on('end', () => {
         }
       }
       for (const entry of snapshot.context) if (failed.has(entry.blob)) manifest.retrievalFailures.push({ path: entry.path, code: failed.get(entry.blob) ?? 'missing_blob' });
+      collectBundleInputs(snapshot);
       snapshot.manifest = manifestSchema.parse(manifest); snapshots.set(workspace, snapshot); return manifest;
     } catch (error) {
       await destroyWorkspace(workspace);
       if (signal?.aborted) throw new SourceError('cancelled');
       manifest.units = []; manifest.retrievalFailures = [{ path: null, code: error instanceof SourceError ? error.code : 'retrieval_failed' }];
       for (const item of manifest.sourceMap) if (item.disposition === 'review') item.disposition = 'retrieval_failure';
+      manifest.bundleInputs = []; manifest.bundleOmissions = [];
+      snapshot.blobs.clear(); snapshot.patches.clear(); snapshot.files.clear(); snapshot.context = [];
+      snapshot.manifest = manifestSchema.parse(manifest); snapshots.set(workspace, snapshot);
       return manifest;
     }
   }
 
-  async function materializeBundle(input: Manifest, unitIds: string[], signal?: AbortSignal): Promise<Bundle> {
-    signal?.throwIfAborted();
+  function captured(input: Manifest): Snapshot {
     const manifest = manifestSchema.parse(input), snapshot = snapshots.get(manifest.workspace);
     if (!snapshot || JSON.stringify(manifest) !== JSON.stringify(snapshot.manifest)) throw new Error('Unknown or modified source manifest');
-    const selected = new Set(unitIds);
-    if (selected.size !== unitIds.length || unitIds.some((id) => !snapshot.patches.has(id))) throw new Error('Unknown or duplicate review unit');
+    return snapshot;
+  }
+
+  async function materializeBundle(input: Manifest, unitIds: string[], signal?: AbortSignal, groupId: string | null = null): Promise<Bundle> {
+    signal?.throwIfAborted();
+    const snapshot = captured(input), descriptor = describeBundle(input, unitIds, groupId);
     const directory = await mkdtemp(join(root, 'bundle-'));
-    const sourceMap: Bundle['sourceMap'] = [], omissions = [...manifest.exclusions, ...manifest.retrievalFailures];
-    let bytes = 0;
     try {
       await mkdir(join(directory, 'data')); await mkdir(join(directory, 'quarantine'));
-      async function add(path: PathIdentity, side: 'old' | 'new' | 'diff', content: Buffer, ids: string[], key: string) {
+      for (const entry of descriptor.sourceMap) {
         signal?.throwIfAborted();
-        const alias = `${quarantine(path) ? 'quarantine' : 'data'}/${hash(key)}.${side}.txt`;
-        const existing = sourceMap.find((item) => item.alias === alias);
-        if (existing) { existing.unitIds = [...new Set([...existing.unitIds, ...ids])].sort(); return; }
-        if (bytes + content.length > limits.maxBundleBytes) { omissions.push({ path, code: 'bundle_limit', unitIds: ids }); return; }
-        await writeFile(join(directory, alias), content, { flag: 'wx', mode: 0o400 });
-        sourceMap.push({ alias, path, side, unitIds: [...ids].sort(), contentHash: hash(content) }); bytes += content.length;
+        const bytes = snapshot.files.get(entry.alias);
+        if (!bytes || hash(bytes) !== entry.contentHash) throw new Error('Captured bundle content mismatch');
+        await writeFile(join(directory, entry.alias), bytes, { flag: 'wx', mode: 0o400 });
       }
-      const units = manifest.units.filter((unit) => selected.has(unit.id));
-      for (const unit of units) {
-        const patch = snapshot.patches.get(unit.id);
-        if (!patch) throw new Error('Missing captured unit');
-        await add(unit.path, 'diff', patch, [unit.id], unit.id);
-        if (unit.kind === 'binary' || unit.kind === 'gitlink') omissions.push({ path: unit.path, code: `${unit.kind}_content`, unitIds: [unit.id] });
-      }
-      if (snapshot.policy.policy.contextMode !== 'diff') {
-        for (const mapping of manifest.sourceMap.filter((item) => units.some((unit) => unit.sourceId === item.id))) {
-          const ids = units.filter((unit) => unit.sourceId === mapping.id).map((unit) => unit.id);
-          for (const side of ['old', 'new'] satisfies ('old' | 'new')[]) {
-            const blob = side === 'old' ? mapping.oldBlobId : mapping.newBlobId, mode = side === 'old' ? mapping.oldMode : mapping.newMode;
-            const path = side === 'old' ? mapping.oldPath ?? mapping.path : mapping.path;
-            if (!blob) continue;
-            const content = snapshot.blobs.get(blob);
-            if (mode === '160000') await add(path, side, Buffer.from(`gitlink ${blob}\n`), ids, `${path.bytesBase64}:${blob}`);
-            else if (content && !content.includes(0) && utf8(content) !== null) await add(path, side, content, ids, `${path.bytesBase64}:${blob}`);
-            else omissions.push({ path, code: 'binary_context' });
-          }
-        }
-        for (const entry of snapshot.context) {
-          const content = snapshot.blobs.get(entry.blob);
-          if (content && !content.includes(0) && utf8(content) !== null) await add(entry.path, 'new', content, [], `${entry.path.bytesBase64}:${entry.blob}`);
-          else if (content) omissions.push({ path: entry.path, code: 'binary_context' });
-        }
-      }
-      sourceMap.sort((a, b) => a.alias.localeCompare(b.alias));
-      const contextHash = hash(JSON.stringify({ policyHash: manifest.identity.policyHash, runtimeHash: manifest.identity.runtimeHash, files: sourceMap }));
       await chmod(join(directory, 'data'), 0o500); await chmod(join(directory, 'quarantine'), 0o500); await chmod(directory, 0o500);
-      return bundleSchema.parse({ directory, contextHash, sourceMap, omissions, allowedReadScope: [directory] });
+      return bundleSchema.parse({ directory, ...descriptor, allowedReadScope: [directory] });
     } catch (error) { await destroyWorkspace(directory); throw error; }
   }
-  return { captureManifest, materializeBundle, destroyWorkspace };
+
+  async function materializePass(manifest: Manifest, input: PlannedPass, signal?: AbortSignal) {
+    const planned = plannedPassSchema.parse(input);
+    const snapshot = captured(manifest);
+    if (planned.kind === 'integration' && (planned.groupId !== null || planned.unitIds.length !== manifest.units.length)) {
+      throw new Error('Integration must include the full comparison');
+    }
+    const descriptor = describeBundle(manifest, planned.unitIds, planned.groupId);
+    if (descriptor.contextHash !== planned.contextHash || JSON.stringify(descriptor.omissions) !== JSON.stringify(planned.omissions)) {
+      throw new Error('Planned bundle descriptor mismatch');
+    }
+    const diffAliases = new Set(descriptor.sourceMap.filter((entry) => entry.side === 'diff').map((entry) => entry.alias));
+    if (new Set(planned.initialAliases).size !== planned.initialAliases.length ||
+      planned.initialAliases.some((alias) => !diffAliases.has(alias)) ||
+      planned.initialAliases.reduce((sum, alias) => sum + (snapshot.files.get(alias)?.length ?? 0), 0) !== planned.initialBytes ||
+      planned.kind === 'scope' && planned.initialAliases.length !== diffAliases.size) throw new Error('Invalid initial bundle descriptor');
+    const bundle = await materializeBundle(manifest, planned.unitIds, signal, planned.groupId);
+    return { spec: { ...planned, bundlePath: bundle.directory }, bundle };
+  }
+
+  async function verifyAncestry(manifest: Manifest, heads: string[], signal?: AbortSignal): Promise<Ancestry> {
+    const snapshot = captured(manifest), ancestorHeadShas: string[] = [];
+    for (const head of [...new Set(heads)].sort()) {
+      reviewIdentitySchema.shape.headSha.parse(head);
+      try {
+        const bases = (await git(join(snapshot.manifest.workspace, 'objects.git'), ['merge-base', '--all', head, manifest.identity.headSha], undefined, signal)).toString().trim().split('\n');
+        if (bases.length === 1 && bases[0] === head) ancestorHeadShas.push(head);
+      } catch (error) { if (signal?.aborted) throw error; }
+    }
+    const proof = Object.freeze({ headSha: manifest.identity.headSha, ancestorHeadShas: Object.freeze(ancestorHeadShas) });
+    verifiedAncestry.add(proof);
+    return proof;
+  }
+  return { captureManifest, materializeBundle, materializePass, verifyAncestry, destroyWorkspace };
 }

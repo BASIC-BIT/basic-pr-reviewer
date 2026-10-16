@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { backup, DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import {
-  admittedEventSchema, attemptStateSchema, passOutcomeSchema, passSpecSchema,
+  admittedEventSchema, attemptStateSchema, passOutcomeSchema, passSpecSchema, plannedPassSchema, validatePassOutcome,
   publicationIntentSchema, reviewIdentitySchema, timestampSchema,
   webhookAdmissionSchema,
 } from './contracts.js';
@@ -46,10 +46,11 @@ function readAttempt(value: unknown): AttemptRecord {
   return { ...record, state: row.state, lease: null };
 }
 
-function readPass(value: unknown): PassRecord {
+function readPass(value: unknown, identity: ReviewIdentity): PassRecord {
   const row = passRowSchema.parse(value);
+  const { bundlePath: _path, ...stored } = JSON.parse(row.spec_json);
   return {
-    id: String(row.id), spec: passSpecSchema.parse(JSON.parse(row.spec_json)),
+    id: String(row.id), identity, spec: plannedPassSchema.parse(stored),
     outcome: passOutcomeSchema.parse(JSON.parse(row.outcome_json)),
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
@@ -206,16 +207,16 @@ export function openStore(path: string): Store {
     },
     savePass(identityInput, specInput, outcomeInput) {
       const identity = reviewIdentitySchema.parse(identityInput);
-      const spec = passSpecSchema.parse(specInput);
-      const outcome = passOutcomeSchema.parse(outcomeInput);
-      if (spec.id !== outcome.passId) throw new Error('Pass ID mismatch');
+      const { bundlePath: _path, ...planned } = 'bundlePath' in specInput ? passSpecSchema.parse(specInput) : { ...plannedPassSchema.parse(specInput), bundlePath: null };
+      const spec = plannedPassSchema.parse(planned);
+      const outcome = validatePassOutcome(spec, outcomeInput);
       transaction(() => {
         assertCurrent(identity);
         const specJson = JSON.stringify(spec);
         const outcomeJson = JSON.stringify(outcome);
         const existing = db.prepare('SELECT * FROM passes WHERE attempt_id = ? AND pass_id = ?').get(identity.attemptId, spec.id);
         if (existing) {
-          const saved = readPass(existing);
+          const saved = readPass(existing, identity);
           if (JSON.stringify(saved.spec) !== specJson) throw new Error('Pass specification is immutable');
           if (JSON.stringify(saved.outcome) === outcomeJson) return;
           if (saved.outcome.status === 'completed') throw new Error('Completed pass is immutable');
@@ -230,9 +231,14 @@ export function openStore(path: string): Store {
         .get(repositoryId, pullNumber);
       if (!row) return null;
       const record = readAttempt(row);
-      const passes = db.prepare('SELECT * FROM passes WHERE attempt_id = ? ORDER BY id').all(record.identity.attemptId).map(readPass);
+      const passes = db.prepare('SELECT * FROM passes WHERE attempt_id = ? ORDER BY id').all(record.identity.attemptId).map((pass) => readPass(pass, record.identity));
       const { rerun_sequence: rerunSequence } = z.object({ rerun_sequence: timestampSchema }).parse(row);
       return { ...record, rerunSequence, passes };
+    },
+    passHistory(repositoryId, pullNumber) {
+      return db.prepare(`SELECT p.*, a.identity_json FROM passes p JOIN attempts a ON a.id = p.attempt_id
+        WHERE a.repository_id = ? AND a.pull_number = ? ORDER BY p.id`).all(repositoryId, pullNumber)
+        .map((row) => readPass(row, reviewIdentitySchema.parse(JSON.parse(z.object({ identity_json: z.string() }).parse(row).identity_json))));
     },
     observation, accessGeneration, accessAllowed,
     restoreAccess(installationId, repositoryId, expectedAccessGeneration) {
