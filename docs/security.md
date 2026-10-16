@@ -20,7 +20,9 @@ Startup holds exclusive service ownership, verifies release files and image iden
 
 ## Retention and operational evidence
 
-Open PR records remain while the PR is open. Closure starts a 30-day retention clock, with reopening and expiry handled by the ledger. Published GitHub reviews remain. Online SQLite snapshots can retain deleted records for the deployment's backup retention plus storage expiry-processing delay. Restore starts paused, purges expired data and reconciles live authority/publications before execution.
+Open PR records remain while the PR is open. Closure starts a 30-day retention clock, with reopening and expiry handled by the ledger. Published GitHub reviews remain. Online SQLite snapshots can retain deleted records for the deployment's backup retention, upload delay and storage expiry-processing delay. Remote expiry usually starts at upload, not snapshot creation. Monitor the age of the uploaded snapshot rather than its upload receipt time. Restore starts paused, purges expired data and reconciles live authority/publications before execution.
+
+The engine prunes only its daily snapshots. Automated release checkpoints, including failed-release checkpoints, need a separate deletion rule in the host's existing maintenance job. Retain them for seven days, then delete on the next maintenance run; document scheduling and outage delays. Preserve current recovery evidence and live publication receipts. Operator-named snapshots require deliberate deletion and must not be described as automatically expiring.
 
 Health and alarms must contain aggregate status, never source, findings, credentials or raw provider diagnostics. Keep inspection output and recovery artifacts private. Prove secret isolation, mounted-path permissions, metadata denial, encrypted remote restore and alarm delivery on the actual host before unattended operation. A green build or advertised credential reference proves none of those live facts.
 

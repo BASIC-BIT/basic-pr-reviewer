@@ -18,6 +18,8 @@ The manifest binds the Git revision, compiled engine modules, schema, lockfile a
 
 The pause client waits up to the pass bound plus 15 minutes, currently 75 minutes of inactivity. A timeout or failed pause-state write is not a drained acknowledgement. Repair storage and obtain a successful pause before restarting or switching publishers. Changing `initiallyPaused` never overrides a saved pause state.
 
+Retain automatic release checkpoints for seven days, including those left by failed promotion attempts. The deployment's existing maintenance job must delete expired checkpoints without touching the current ledger or publication receipts, even when remote backup delivery is failing. Keep recent checkpoints available for recovery. Record the maintenance interval and outage-related deletion delay in the host runbook; the engine's daily-snapshot pruning does not delete operator or release checkpoints.
+
 ## Rollback and restore
 
 Ordinary rollback switches to a proven compatible previous binary and its matching manifest/images, retaining the current ledger. Re-run the drain/checkpoint/compatibility procedure. Never restore an older database over newer publication receipts to make an old binary start. A changed runtime identity invalidates incompatible coverage, and a current integration pass remains required.
