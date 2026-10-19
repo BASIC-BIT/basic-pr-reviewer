@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { chmod, statfs, rm } from 'node:fs/promises';
 import { z } from 'zod';
@@ -10,7 +11,7 @@ import { createRetention } from './retention.js';
 import { loadPolicy, ConfigurationError } from './policy.js';
 import { GitHubAccessError } from './github.js';
 import type { GitHubPort } from './github.js';
-import type { Store, LivePull } from './contracts.js';
+import type { Store, LivePull, PublicationOutcome, PublicationTarget } from './contracts.js';
 
 export type ServiceComponents = {
   store: Store; github: GitHubPort; source: SchedulerOptions['source']; worker: SchedulerOptions['worker'];
@@ -57,7 +58,7 @@ export async function startService(config: ServiceConfig) {
   let stopping = false, paused = false, timer: ReturnType<typeof setTimeout> | undefined;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined, heartbeatWork: Promise<void> | null = null;
   let pauseChange: Promise<void> = Promise.resolve();
-  let activeCycle: Promise<void> | null = null, lastCycleAt = now(), lastReconcile = now(), lastPurge = 0;
+  let activeCycle: Promise<void> | null = null, lastCycleAt = now(), lastPurge = 0;
   let pauseFailure = false;
   let reason: string | null = null, publicationFailures = 0, freeBytes = 0;
   const requests = new Set<Promise<void>>();
@@ -100,23 +101,37 @@ export async function startService(config: ServiceConfig) {
       if (!heartbeatWork) heartbeatWork = health().then(config.heartbeat).catch(() => { reason = 'heartbeat_failed'; }).finally(() => { heartbeatWork = null; });
       await heartbeatWork;
     }
+    const reconciledPublications = new Map<string, number>();
     async function dispatch(): Promise<void> {
+      const retained = new Set<string>();
+      async function reconcile(value: unknown, target: PublicationTarget, action: () => Promise<PublicationOutcome>) {
+        const key = createHash('sha256').update(JSON.stringify(value)).digest('hex');
+        retained.add(key);
+        const due = reconciledPublications.get(key) ?? 0;
+        const uncertain = store.publicationOperations(target.repositoryId, target.pullNumber).some(operation => operation.state === 'sending');
+        if (now() < due && !uncertain) return;
+        const outcome = await action();
+        if (outcome.status === 'published') reconciledPublications.set(key, now() + RECONCILIATION_INTERVAL_MS);
+        else reconciledPublications.delete(key);
+      }
       for (const installation of store.trackedInstallations()) for (const pull of store.trackedPulls(installation)) {
         for (const record of store.publications(pull.repositoryId, pull.pullNumber)) {
           if (paused || stopping) return;
-          if (record.state === 'planned') await publisher.reconcilePublication(record);
+          if (record.state === 'planned') await reconcile(record, record.intent.identity, () => publisher.reconcilePublication(record));
         }
       }
       for (const notice of store.publicationNotices()) {
         if (paused || stopping) return;
-        if (store.publicationFenceCurrent({ kind: 'notice', noticeId: notice.id })) await publisher.reconcileNotice(notice);
+        if (store.publicationFenceCurrent({ kind: 'notice', noticeId: notice.id })) await reconcile(notice, notice.target, () => publisher.reconcileNotice(notice));
       }
+      for (const key of reconciledPublications.keys()) if (!retained.has(key)) reconciledPublications.delete(key);
     }
     // Ownership precedes all cleanup, and live reconciliation precedes any publication.
     await scheduler.recoverWorker();
     store.interruptLeases(now()); scheduler.recoverExpiredLeases(now());
     await retention.purgeExpired(now());
-    await admission.reconcileInstalled();
+    const initial = await admission.reconcileDue();
+    if (initial.error !== null) reason = 'reconciliation_failed';
     async function cycle(): Promise<void> {
       if (stopping || activeCycle) return activeCycle ?? Promise.resolve();
       const work = async () => {
@@ -125,7 +140,9 @@ export async function startService(config: ServiceConfig) {
           const status = await health();
           if (!status.database || status.freeBytes < (config.minimumFreeBytes ?? 512 * 1024 * 1024)) throw new Error('storage_unavailable');
           if (now() - lastPurge >= 86400000) { await retention.purgeExpired(now()); await dailyBackup(now()); lastPurge = now(); }
-          if (now() - lastReconcile >= RECONCILIATION_INTERVAL_MS) { await admission.reconcileInstalled(); lastReconcile = now(); }
+          const reconciliation = await admission.reconcileDue();
+          if (reconciliation.error !== null) reason = 'reconciliation_failed';
+          if (!reconciliation.ready) return;
           if (scheduler.recoveryRequired) await scheduler.recoverWorker();
           if (!paused && !stopping) await scheduler.tick(now());
           if (!paused && !stopping) await dispatch();
@@ -158,7 +175,11 @@ export async function startService(config: ServiceConfig) {
           operations: store.publicationOperations(parsed.repositoryId, parsed.pullNumber) };
         case 'pause': await changePause(true); return { paused, drained: true };
         case 'resume': await changePause(false); return { paused };
-        case 'reconcile': await admission.reconcileInstalled(); return { reconciled: true };
+        case 'reconcile': {
+          if (activeCycle) await activeCycle;
+          const status = await admission.reconcileDue(true);
+          return { reconciled: status.error === null, nextReconcileAt: status.nextAt };
+        }
         case 'backup': await backup(parsed.destination); return { backedUp: true };
       }
     }

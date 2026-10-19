@@ -18,9 +18,11 @@ function setup(handler?: (path: string) => { status: number; data: unknown; head
     const custom = handler?.(url.pathname);
     const data = custom?.data ?? (
       url.pathname === '/app/installations/100' ? { id: 100, suspended_at: null, account: { id: 400 } } :
+      url.pathname === '/app/installations' ? [{ id: 100, account: { id: 400 }, suspended_at: null }] :
       url.pathname === '/app/installations/100/access_tokens' ? { token: 'synthetic-installation-token', expires_at: new Date(Date.now() + 3_600_000).toISOString(), repository_selection: 'all', permissions: {} } :
       url.pathname === '/repositories/200' ? repo :
       url.pathname === '/repos/trusted-owner/fixture/pulls/42' ? live :
+      url.pathname === '/repos/trusted-owner/fixture/git/ref/heads/main' ? { ref: 'refs/heads/main', object: { type: 'commit', sha: base } } :
       url.pathname.startsWith('/repos/trusted-owner/fixture/compare/') ? { base_commit: { sha: base }, merge_base_commit: { sha: merge } } :
       url.pathname === '/installation/repositories' ? { repositories: [repo] } :
       url.pathname === '/repos/trusted-owner/fixture/pulls' ? [{ number: 42 }] :
@@ -31,6 +33,50 @@ function setup(handler?: (path: string) => { status: number; data: unknown; head
   return { calls, github: createGitHubAdapter({ appId: '300', privateKey: key, ownerIds: ['400'], fetch: transport }) };
 }
 describe('Octokit installation adapter with synthetic HTTP transport', () => {
+  it('uses the live canonical target ref when PR base metadata is old, including missed push and rerun', async () => {
+    let tip = base;
+    const { calls, github } = setup(path => {
+      if (path.endsWith('/git/ref/heads/main')) return { status: 200, data: { ref: 'refs/heads/main', object: { type: 'commit', sha: tip } } };
+      if (path.includes('/compare/')) return { status: 200, data: { base_commit: { sha: path.split('/').at(-1)!.split('...')[0] }, merge_base_commit: { sha: merge } } };
+      if (path.endsWith('/permission')) return { status: 200, data: { permission: 'write' } };
+      if (path.includes('/contents/')) {
+        const text = decodeURIComponent(path).endsWith('/.github/claude-review.json') ? JSON.stringify({ schemaVersion: 1, enabled: true, baseBranches: ['main'] }) : 'Synthetic trusted policy';
+        return { status: 200, data: { type: 'file', encoding: 'base64', size: Buffer.byteLength(text), content: Buffer.from(text).toString('base64') } };
+      }
+      return undefined;
+    });
+    const store = openStore(':memory:');
+    try {
+      const admission = createAdmissionService({ store, github, webhookSecret: 'synthetic-secret', appId: '300', ownerIds: ['400'], runtimeHash: 'e'.repeat(64) });
+      async function send(event: string, extra: object) {
+        const body = Buffer.from(JSON.stringify({ installation: { id: 100 }, repository: { id: 200 }, sender: { login: 'human', type: 'User' }, ...extra }));
+        return admission.admitWebhook({ 'x-github-event': event, 'x-github-delivery': event,
+          'x-hub-signature-256': `sha256=${createHmac('sha256', 'synthetic-secret').update(body).digest('hex')}` }, body);
+      }
+      expect(await send('pull_request', { action: 'opened', number: 42, pull_request: { number: 42, head: { sha: head } } })).toMatchObject({ kind: 'admitted' });
+      tip = 'd'.repeat(40);
+      const current = await github.readLivePull('100', '200', 42);
+      expect(current).toMatchObject({ baseSha: tip, mergeBaseSha: merge });
+      expect(calls.at(-1)?.url.pathname).toBe(`/repos/trusted-owner/fixture/compare/${tip}...${head}`);
+      await admission.reconcilePull('200', 42);
+      expect(store.observation('200', 42).blockedReason).toBe('base_changed');
+      expect(store.claim(Date.now())).toBeNull();
+      expect(await send('issue_comment', { action: 'created', issue: { number: 42, pull_request: {} },
+        comment: { id: 900, body: '/claude-review rerun', user: { login: 'human', type: 'User' } } })).toMatchObject({ kind: 'admitted' });
+      expect(store.current('200', 42)?.identity).toMatchObject({ baseSha: tip, mergeBaseSha: merge });
+      expect(calls.filter(call => call.url.pathname.includes('/contents/')).slice(-2).every(call => call.url.searchParams.get('ref') === tip)).toBe(true);
+    } finally { store.close(); }
+  });
+  it.each([
+    { ref: 'refs/heads/other', object: { type: 'commit', sha: base } },
+    { ref: 'refs/heads/main', object: { type: 'tag', sha: base } },
+    { ref: 'refs/heads/main', object: { type: 'commit', sha: 'invalid' } },
+    null,
+  ])('fails closed on missing or malformed target ref evidence: %j', async data => {
+    const { github, calls } = setup(path => path.includes('/git/ref/') ? { status: data === null ? 404 : 200, data: data ?? { message: 'Not Found' } } : undefined);
+    await expect(github.readLivePull('100', '200', 42)).rejects.toThrow();
+    expect(calls.some(call => call.url.pathname.includes('/compare/'))).toBe(false);
+  });
   it('paginates owned publications and limits mutation tokens to the repository and operation', async () => {
     let comments = 0, reviews = 0, checks = 0;
     const { calls, github } = setup(path => {
@@ -191,7 +237,7 @@ describe('Octokit installation adapter with synthetic HTTP transport', () => {
     try {
       const service = createAdmissionService({ store, github, webhookSecret: 'synthetic-secret', appId: '300', ownerIds: ['400'], runtimeHash: 'e'.repeat(64) });
       const body = Buffer.from(JSON.stringify({ action: 'opened', installation: { id: 100 }, repository: { id: 200 },
-        sender: { login: 'human', type: 'User' }, number: 42, pull_request: { number: 42 } }));
+        sender: { login: 'human', type: 'User' }, number: 42, pull_request: { number: 42, head: { sha: head } } }));
       const headers = { 'x-github-event': 'pull_request', 'x-github-delivery': 'secondary-limit',
         'x-hub-signature-256': `sha256=${createHmac('sha256', 'synthetic-secret').update(body).digest('hex')}` };
       await expect(service.admitWebhook(headers, body)).rejects.toMatchObject({ rateLimited: true });

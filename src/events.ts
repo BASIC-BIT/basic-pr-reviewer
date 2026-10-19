@@ -18,7 +18,7 @@ type Actor = z.infer<typeof actorSchema>;
 type Context = {
   installationId: string; repositoryId: string; pullNumber: number; deliveryId: string;
   actor: Actor | null; kind: 'automatic' | 'rerun' | 'base' | 'reconcile';
-  action: string; label: string | null; commandKey: string | null; checkRunId: string | null;
+  action: string; label: string | null; commandKey: string | null; checkRunId: string | null; deliveryHead?: string;
 };
 const ignored = (reason: string): WebhookAdmission => ({ kind: 'ignored', reason });
 const protectedReasons = new Set(['skipped', 'disabled', 'base_changed', 'retarget', 'access_revoked']);
@@ -90,11 +90,13 @@ export function createAdmissionService(options: {
           cancel('configuration_failure');
           return { kind: 'configuration_failure', reason: error.message };
         }
-        const reason = ineligible(pull, trusted.policy, context.actor);
+        const reason = ineligible(pull, trusted.policy, null);
         if (reason) return cancel(reason);
         if (context.kind === 'reconcile' && observed.blockedReason === 'bot_actor' && observed.observedHeadSha === pull.headSha) return ignored('waiting_for_authorized_actor');
         if (context.kind === 'reconcile' && (!current || current.identity.headSha !== pull.headSha)) return cancel('actor_provenance_unknown');
         if (context.kind === 'automatic') {
+          // A signed sender only establishes actor eligibility for that delivery's head.
+          if (context.deliveryHead !== pull.headSha) return ignored('stale_delivery_head');
           if (context.action === 'labeled' || context.action === 'unlabeled') {
             if (!context.label || !trusted.policy.skipLabels.includes(context.label)) return ignored('irrelevant_label');
             if (context.action === 'unlabeled' && !trusted.policy.rerunOnUnskip) {
@@ -105,6 +107,8 @@ export function createAdmissionService(options: {
             return ignored('lifecycle_currently_eligible');
           }
         }
+        const actorReason = ineligible(pull, trusted.policy, context.actor);
+        if (actorReason) return cancel(actorReason);
         if (context.kind === 'rerun') {
           if (!context.actor || context.actor.type !== 'User') return ignored('human_rerun_required');
           if (!['write', 'maintain', 'admin'].includes(await github.readPermission(pull, context.actor.login))) return ignored('write_permission_required');
@@ -180,10 +184,10 @@ export function createAdmissionService(options: {
       const base = { installationId, repositoryId, deliveryId, actor: meta.sender, action: common.action ?? '',
         label: null, commandKey: null, checkRunId: null };
       if (event === 'pull_request') {
-        const value = z.object({ action: z.string(), number, pull_request: z.object({ number }), label: z.object({ name: z.string() }).optional() }).parse(raw);
+        const value = z.object({ action: z.string(), number, pull_request: z.object({ number, head: z.object({ sha: livePullSchema.shape.headSha }) }), label: z.object({ name: z.string() }).optional() }).parse(raw);
         if (value.number !== value.pull_request.number) throw new Error('Webhook pull number mismatch');
         receiptTarget = { repositoryId, pullNumber: value.number };
-        result = await processPull({ ...base, kind: 'automatic', pullNumber: value.number, label: value.label?.name ?? null });
+        result = await processPull({ ...base, kind: 'automatic', pullNumber: value.number, deliveryHead: value.pull_request.head.sha, label: value.label?.name ?? null });
       } else if (event === 'issue_comment') {
         const value = z.object({ action: z.string(), issue: z.object({ number, pull_request: z.object({}).optional() }),
           comment: z.object({ id, body: z.string(), user: actorSchema }) }).parse(raw);
@@ -272,24 +276,40 @@ export function createAdmissionService(options: {
     if (headers['x-ratelimit-remaining'] === '0' && typeof headers['x-ratelimit-reset'] === 'string') return Math.max(1000, Number(headers['x-ratelimit-reset']) * 1000 - now);
     return parsed.data.status === 429 || parsed.data.rateLimited ? 60_000 : null;
   }
-  // Startup and recurring execution stay serial. The host owns shutdown and the alarm.
+  let nextReconcileAt = 0, rateLimitFailures = 0, reconciliationReady = false;
+  let reconciliationError: unknown = null;
+  let reconciling: Promise<void> | null = null;
+  async function reconcileDue(force = false) {
+    if (reconciling) await reconciling;
+    else if (now() >= nextReconcileAt || force && reconciliationError === null) {
+      reconciling = (async () => {
+        let delay = RECONCILIATION_INTERVAL_MS;
+        try {
+          await reconcileInstalled();
+          rateLimitFailures = 0; reconciliationError = null; reconciliationReady = true;
+        } catch (error) {
+          reconciliationError = error;
+          const limited = retryAfter(error, now());
+          rateLimitFailures = limited === null ? 0 : Math.min(rateLimitFailures + 1, 5);
+          if (limited !== null) delay = Math.max(limited, Math.min(RECONCILIATION_INTERVAL_MS, 60_000 * 2 ** (rateLimitFailures - 1)));
+        }
+        nextReconcileAt = now() + timestampSchema.parse(delay);
+      })();
+      try { await reconciling; } finally { reconciling = null; }
+    }
+    return { ready: reconciliationReady, error: reconciliationError, nextAt: nextReconcileAt };
+  }
+  // Standalone hosts and the service cycle share one serial scan and retry deadline.
   function startReconciliation(onError: (error: unknown) => void): () => void {
     let stopped = false;
-    let rateLimitFailures = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
     async function run() {
-      let delay = RECONCILIATION_INTERVAL_MS;
-      try { await reconcileInstalled(); rateLimitFailures = 0; }
-      catch (error) {
-        onError(error);
-        const limited = retryAfter(error);
-        rateLimitFailures = limited === null ? 0 : Math.min(rateLimitFailures + 1, 5);
-        if (limited !== null) delay = Math.max(limited, Math.min(RECONCILIATION_INTERVAL_MS, 60_000 * 2 ** (rateLimitFailures - 1)));
-      }
-      if (!stopped) { timer = setTimeout(() => { void run(); }, timestampSchema.parse(delay)); timer.unref(); }
+      const status = await reconcileDue();
+      if (status.error !== null) onError(status.error);
+      if (!stopped) { timer = setTimeout(() => { void run(); }, Math.max(1, status.nextAt - now())); timer.unref(); }
     }
     void run();
     return () => { stopped = true; if (timer) clearTimeout(timer); };
   }
-  return { admitWebhook, reconcilePull, reconcileInstalled, startReconciliation };
+  return { admitWebhook, reconcilePull, reconcileInstalled, reconcileDue, startReconciliation };
 }

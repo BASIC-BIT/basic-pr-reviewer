@@ -92,7 +92,7 @@ A PR comment containing exactly `/claude-review rerun`, apart from surrounding w
 
 Unskip does not start work unless `rerunOnUnskip` is true. Reconciliation preserves deliberate skipped, disabled, revoked, retargeted, and base-invalidated state for the same head. A new eligible head or authorized explicit rerun can start a fresh generation. A disallowed bot actor cannot be bypassed by reconciling the same head.
 
-Base pushes only invalidate comparisons. They do not queue inference or create publication intents, including for a PR never reviewed before. Reconciliation also detects missed base-only movement when a prior identity exists. A delayed lifecycle delivery uses current GitHub state rather than restoring the old payload's PR snapshot.
+Base pushes only invalidate comparisons. They do not queue inference or create publication intents, including for a PR never reviewed before. Reconciliation also detects missed base-only movement when a prior identity exists. A delayed lifecycle delivery uses current GitHub state for closure, draft, skip and access cancellation. Automatic actor eligibility applies only when the signed delivery head matches the current head; unrelated labels cannot authorize or cancel work through their sender.
 
 ## Recovery and host integration
 
@@ -100,8 +100,12 @@ Base pushes only invalidate comparisons. They do not queue inference or create p
 
 Fresh approved-owner installation and repository-access reads can clear stale durable denial after a missed re-add/unsuspend or delayed removal event. Restoration checks the access clock atomically, so metadata read before a concurrent revocation cannot clear that revocation. It preserves cancelled attempts and the same-head waiting rule. A later eligible head or authorized explicit rerun can start fresh work.
 
-`startReconciliation(onError)` starts one scan immediately, then scans every 15 minutes without overlap. It honors GitHub's `Retry-After` and primary rate-limit reset timing. Secondary-limit responses without retry timing wait at least one minute. Repeated limits increase the delay through two, four, eight, and fifteen minutes, with longer provider timing still taking precedence. A successful scan restores the normal cadence. The returned stop function prevents subsequent scans; it does not interrupt an in-flight HTTP request. The host owns HTTP status handling, process shutdown, actionable alarms, worker cancellation, and publication. Callers receive sanitized request errors with a safe `rateLimited` flag and no authenticated request headers or response bodies.
+The service calls `reconcileDue()` at startup and during its serial cycle. The standalone `startReconciliation(onError)` timer uses the same scan state and retry deadline. Both scan immediately, then every 15 minutes without overlap. They honor GitHub's `Retry-After` and primary rate-limit reset timing. Secondary-limit responses without retry timing wait at least one minute. Repeated limits increase the delay through two, four, eight, and fifteen minutes, with longer provider timing still taking precedence. A successful scan restores the normal cadence.
 
-The schema is version 2 and rejects other existing schema versions. No runtime ledger has shipped, so this implementation does not include a schema migration system. Future upgrades must preserve existing generations and records deliberately.
+Startup failures leave scheduling and publication blocked until the first successful scan. Later scan failures report unhealthy reconciliation while allowing scheduled work and publication to continue through their own live guards. Operator reconciliation also respects an active retry deadline.
+
+The standalone timer's returned stop function prevents subsequent scans; it does not interrupt an in-flight HTTP request. The host owns HTTP status handling, process shutdown, actionable alarms, worker cancellation, and publication. Callers receive sanitized request errors with a safe `rateLimited` flag and no authenticated request headers or response bodies.
+
+The ledger uses schema 5, with additive upgrades from schemas 2, 3, and 4 that preserve existing records. Other existing versions are rejected. Rollback retains the current ledger and requires a binary compatible with schema 5; an older binary that rejects it needs a reviewed compatibility build. See [release and rollback](operations.md#release-and-synthetic-acceptance) for the operating procedure.
 
 Authentication and signature behavior follow the upstream [Octokit App authentication](https://github.com/octokit/auth-app.js) and [Octokit webhooks](https://github.com/octokit/webhooks.js) interfaces. Tests use an ephemeral RSA key and a synthetic HTTP transport, with no live App or provider calls.

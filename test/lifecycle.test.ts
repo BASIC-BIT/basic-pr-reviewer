@@ -2,7 +2,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Socket } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { profile } from '../src/worker.js';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHmac, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { fixture, git, temp, policy } from './fixtures/source.js';
@@ -12,7 +12,7 @@ import type { RunningService, ServiceHealth } from '../src/main.js';
 import { openStore } from '../src/store.js';
 import { createBackups } from '../src/retention.js';
 import { controlRequest, loadSecret, CredentialFailure } from '../src/runtime.js';
-import { GitHubAccessError } from '../src/github.js';
+import { createGitHubAdapter, GitHubAccessError } from '../src/github.js';
 import type { GitHubPort, OwnedPublication, ReviewThread } from '../src/github.js';
 import type { LivePull, PassOutcome, PassSpec, Store } from '../src/contracts.js';
 import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
@@ -71,12 +71,75 @@ async function setup(initiallyPaused = false) {
     running.push(service); return service;
   }
   async function send(service:RunningService,action='synchronize',delivery: string=randomUUID()) {
-    const value={action,installation:{id:1},repository:{id:2},number:3,pull_request:{number:3},sender:{login:'human',type:'User'},...(action==='labeled'||action==='unlabeled'?{label:{name:'skip-review'}}:{})};
+    const value={action,installation:{id:1},repository:{id:2},number:3,pull_request:{number:3,head:{sha:live.headSha}},sender:{login:'human',type:'User'},...(action==='labeled'||action==='unlabeled'?{label:{name:'skip-review'}}:{})};
     const body=JSON.stringify(value),address=service.webhookAddress;if(!address||typeof address==='string')throw new Error('address');
     return fetch(`http://127.0.0.1:${address.port}/webhook`,{method:'POST',headers:{'x-github-event':'pull_request','x-github-delivery':delivery,'x-hub-signature-256':`sha256=${createHmac('sha256','synthetic-hook').update(body).digest('hex')}`},body});
   }
-  return {failPauseWrites:()=>{pauseWriteFails=true;},setHook:(next:typeof hook)=>{hook=next;},start,send,root,sourceRoot,socket,live,remote,owned,threads,calls,heartbeats,store:()=>store!,advance:(ms:number)=>{now+=ms;},setMode:(m:typeof mode)=>{mode=m;},lose:()=>{loseResponse=true;},revoke:()=>{revoked=true;},now:()=>now};
+  return {github,failPauseWrites:()=>{pauseWriteFails=true;},setHook:(next:typeof hook)=>{hook=next;},start,send,root,sourceRoot,socket,live,remote,owned,threads,calls,heartbeats,store:()=>store!,advance:(ms:number)=>{now+=ms;},setMode:(m:typeof mode)=>{mode=m;},lose:()=>{loseResponse=true;},revoke:()=>{revoked=true;},now:()=>now};
 }
+it.each(['retry-after', 'primary', 'secondary'] as const)('service honors %s limits at startup and during recurring scans', async kind => {
+  const f = await setup();
+  let limited = true, scans = 0;
+  const wait = kind === 'secondary' ? 60_000 : 1_200_000;
+  let reset = f.now() + wait;
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const adapter = createGitHubAdapter({ appId: '5', privateKey: key, ownerIds: ['4'], fetch: async () => {
+    scans++;
+    const headers = kind === 'retry-after' ? { 'retry-after': '1200' } : kind === 'primary'
+      ? { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset / 1000) } : { 'x-ratelimit-remaining': '100' };
+    return new Response(JSON.stringify(limited ? { message: kind === 'secondary' ? 'You have exceeded a secondary rate limit.' : 'API rate limit exceeded' } : []),
+      { status: limited ? 403 : 200, headers: { 'content-type': 'application/json', ...headers } });
+  } });
+  f.github.listInstallations = adapter.listInstallations;
+  const service = await f.start();
+  expect(scans).toBe(1);
+  await f.send(service, 'opened');
+  f.advance(5000); await service.cycle();
+  expect(scans).toBe(1); expect(f.calls).toHaveLength(0); expect(f.owned).toHaveLength(0);
+  expect((await service.health()).healthy).toBe(false);
+  f.advance(wait - 5001); await service.cycle(); expect(scans).toBe(1);
+  limited = false; f.advance(1); await service.cycle();
+  expect(scans).toBe(2); expect(f.calls).toHaveLength(1); expect(f.owned.length).toBeGreaterThan(0);
+  limited = true; f.advance(900_000); reset = f.now() + wait; await service.cycle();
+  expect(scans).toBe(3);
+  expect(f.store().current('2', 3)?.result?.complete).toBe(true);
+  f.advance(5000); await service.cycle(); expect(scans).toBe(3);
+  await service.command({ command: 'reconcile' }); expect(scans).toBe(3);
+  limited = false; f.advance(wait - 5000); await service.cycle(); expect(scans).toBe(4);
+  expect((await service.health()).healthy).toBe(true);
+});
+it('service skips completed idle scans but dispatches changed progress and lost acknowledgements promptly', async () => {
+  const f = await setup();
+  let scans = 0;
+  const list = f.github.listOwnedPublications;
+  f.github.listOwnedPublications = async target => { scans++; return list(target); };
+  const service = await f.start(); await f.send(service, 'opened');
+  f.lose(); await service.cycle();
+  expect(f.store().publicationOperations('2', 3).some(op => op.state === 'sending')).toBe(true);
+  f.advance(5000); await service.cycle();
+  expect(f.store().current('2', 3)?.result?.complete).toBe(true);
+  expect(f.store().publicationOperations('2', 3).every(op => op.state === 'acknowledged')).toBe(true);
+  expect(f.threads).toHaveLength(1);
+  const completed = scans;
+  f.advance(5000); await service.cycle(); f.advance(5000); await service.cycle();
+  expect(scans).toBe(completed);
+  // Simulate a persisted resolve write whose response was lost after the last successful scan.
+  const record = f.store().publications('2', 3).find(record => record.state === 'planned' && record.intent.channel === 'summary')!;
+  const { attemptId, generation, policyHash, runtimeHash, ...target } = record.intent.identity;
+  const operation = f.store().planPublicationOperation({ key: 'f'.repeat(64), fence: { kind: 'review', publicationId: record.id },
+    target, channel: 'resolve', body: f.threads[0]!.id });
+  f.store().markPublicationSending(operation.key);
+  f.threads[0]!.resolved = true; f.threads[0]!.hasReplies = true;
+  f.advance(5000); await service.cycle();
+  expect(f.threads[0]!.resolved).toBe(false);
+  expect(f.store().publicationOperations('2', 3).filter(op => ['resolve', 'unresolve'].includes(op.channel)).every(op => op.state === 'acknowledged')).toBe(true);
+  const beforePeriodicRepair = scans;
+  f.advance(900_000); await service.cycle(); expect(scans).toBeGreaterThan(beforePeriodicRepair);
+  const repaired = scans;
+  f.live.labels = ['skip-review']; await f.send(service, 'labeled'); await service.cycle();
+  expect(scans).toBeGreaterThan(repaired); expect(f.owned.find(row => row.channel === 'summary')?.body).toContain('cancelled');
+  const cancelled = scans; f.advance(5000); await service.cycle(); expect(scans).toBe(cancelled);
+});
 it('runs duplicate admission, partial retry preservation, integration recovery, restart, reuse and publication reconciliation', async()=>{
   const f=await setup();let service=await f.start();
   expect(f.store().current('2',3)).toBeNull();

@@ -259,14 +259,17 @@ export function createGitHubAdapter(options: {
       const parameters = { owner: repo.owner.login, repo: repo.name };
       const pull = apiPull.parse(await request(installationId, repositoryId, 'GET /repos/{owner}/{repo}/pulls/{pull_number}', { ...parameters, pull_number: pullNumber }));
       if (pull.number !== pullNumber || pull.base.repo.id !== repositoryId) throw new GitHubAccessError(installationId, repositoryId);
+      const ref = z.object({ ref: z.literal(`refs/heads/${pull.base.ref}`), object: z.object({ type: z.literal('commit'), sha }) }).parse(
+        await request(installationId, repositoryId, 'GET /repos/{owner}/{repo}/git/ref/heads/{branch}', { ...parameters, branch: pull.base.ref }));
+      const baseSha = ref.object.sha;
       const comparison = z.object({ base_commit: z.object({ sha }), merge_base_commit: z.object({ sha }) }).parse(
         await request(installationId, repositoryId, 'GET /repos/{owner}/{repo}/compare/{basehead}', {
-          ...parameters, basehead: `${pull.base.sha}...${pull.head.sha}`,
+          ...parameters, basehead: `${baseSha}...${pull.head.sha}`,
         }));
-      if (comparison.base_commit.sha !== pull.base.sha) throw new Error('GitHub comparison base identity mismatch');
+      if (comparison.base_commit.sha !== baseSha) throw new Error('GitHub comparison base identity mismatch');
       return livePullSchema.parse({ installationId, repositoryId, ownerId: repo.owner.id, owner: repo.owner.login, repo: repo.name,
         pullNumber, headRepositoryId: pull.head.repo?.id ?? null, baseRepositoryId: pull.base.repo.id,
-        headSha: pull.head.sha, baseRef: pull.base.ref, baseSha: pull.base.sha,
+        headSha: pull.head.sha, baseRef: pull.base.ref, baseSha,
         mergeBaseSha: comparison.merge_base_commit.sha, draft: pull.draft, state: pull.state,
         closedAt: pull.closed_at ? Date.parse(pull.closed_at) : null,
         labels: pull.labels.map((label) => label.name), author: pull.user });

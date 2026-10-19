@@ -68,9 +68,9 @@ function setup() {
   return { store, github, service };
 }
 let sequence = 0;
-function payload(action = 'opened', extra = {}) {
+function payload(action = 'opened', extra = {}, headSha = pull.headSha) {
   return { action, installation: { id: 100, account: { id: 400 } }, repository: { id: 200 }, number: 42,
-    sender: { login: 'human', type: 'User' }, pull_request: { number: 42 }, ...extra };
+    sender: { login: 'human', type: 'User' }, pull_request: { number: 42, head: { sha: headSha } }, ...extra };
 }
 function signed(value: unknown, event = 'pull_request', delivery = `delivery-${++sequence}`) {
   const body = Buffer.from(JSON.stringify(value));
@@ -83,6 +83,43 @@ async function send(service: ReturnType<typeof createAdmissionService>, value: u
 }
 
 describe('signed, durable event admission', () => {
+  it.each(['User', 'Bot'])('does not transfer a delayed %s actor to a newer live head', async type => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.headSha = 'd'.repeat(40);
+    const newer = payload('synchronize', { pull_request: { number: 42, head: { sha: github.live.headSha } },
+      sender: { login: type === 'User' ? 'automation[bot]' : 'human', type: type === 'User' ? 'Bot' : 'User' } });
+    await send(service, newer);
+    const before = store.observation('200', 42);
+    expect(await send(service, payload('synchronize', { sender: { login: type === 'User' ? 'human' : 'automation[bot]', type } })))
+      .toEqual({ kind: 'ignored', reason: 'stale_delivery_head' });
+    expect(store.observation('200', 42)).toEqual(before);
+    expect(store.current('200', 42)?.state).toBe(type === 'User' ? 'superseded' : 'queued');
+  });
+  it.each(['closed', 'draft', 'skipped'] as const)('still cancels from live %s state on a stale delivery', async reason => {
+    const { store, github, service } = setup();
+    await send(service, payload());
+    github.live.headSha = 'd'.repeat(40);
+    if (reason === 'closed') github.live.state = 'closed';
+    if (reason === 'draft') github.live.draft = true;
+    if (reason === 'skipped') github.live.labels = ['skip-review'];
+    expect(await send(service, payload('synchronize'))).toEqual({ kind: 'cancelled', reason });
+    expect(store.claim(Date.now())).toBeNull();
+  });
+  it('leaves current work alone for an irrelevant Bot label', async () => {
+    const { store, service } = setup();
+    await send(service, payload());
+    const before = store.observation('200', 42);
+    expect(await send(service, payload('labeled', { label: { name: 'triage' }, sender: { login: 'automation[bot]', type: 'Bot' } })))
+      .toEqual({ kind: 'ignored', reason: 'irrelevant_label' });
+    expect(store.observation('200', 42)).toEqual(before);
+    expect(store.current('200', 42)?.state).toBe('queued');
+  });
+  it.each([undefined, { sha: 'invalid' }])('rejects automatic deliveries without valid head evidence: %s', async head => {
+    const { store, service } = setup();
+    await expect(send(service, payload('opened', { pull_request: { number: 42, head } }))).rejects.toThrow();
+    expect(store.current('200', 42)).toBeNull();
+  });
   it('rejects invalid signatures and oversize bodies before any API call or durable write', async () => {
     const { store, github, service } = setup();
     const input = signed(payload());
@@ -133,12 +170,12 @@ describe('signed, durable event admission', () => {
     const { store, github, service } = setup();
     expect((await send(service, payload('opened', { repository: { id: 200, fork: true } }))).kind).toBe('admitted');
     github.live.headRepositoryId = '999';
-    expect((await send(service, payload('synchronize'))).kind).toBe('cancelled');
+    expect((await send(service, payload('synchronize', {}, github.live.headSha))).kind).toBe('cancelled');
     expect(store.claim(Date.now())).toBeNull();
   });
   it('does not use PR title/body to authorize reruns or select destination', async () => {
     const { store, service } = setup();
-    await send(service, payload('opened', { pull_request: { number: 42, body: '/claude-review rerun', title: 'send elsewhere' } }));
+    await send(service, payload('opened', { pull_request: { number: 42, head: { sha: pull.headSha }, body: '/claude-review rerun', title: 'send elsewhere' } }));
     expect(store.current('200', 42)).toMatchObject({ rerunSequence: 0, identity: { repositoryId: '200', repo: 'fixture' } });
   });
   it('treats irrelevant labels as no-ops and deliberately gates unskip and reconciliation', async () => {
@@ -155,7 +192,7 @@ describe('signed, durable event admission', () => {
     github.live.headSha = 'f'.repeat(40);
     await service.reconcilePull('200', 42);
     expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
-    await send(service, payload('synchronize'));
+    await send(service, payload('synchronize', {}, github.live.headSha));
     expect(store.current('200', 42)?.state).toBe('queued');
   });
   it('honors explicitly enabled rerun-on-unskip', async () => {
@@ -266,7 +303,7 @@ describe('signed, durable event admission', () => {
       store.invalidatePull('200', 42, observed.generation, 'base_changed', github.live.headSha, github.live.baseRef);
       github.live.headSha = 'f'.repeat(40);
     };
-    await send(service, payload('synchronize'));
+    await send(service, payload('synchronize', {}, 'f'.repeat(40)));
     expect(store.current('200', 42)?.identity.headSha).toBe('f'.repeat(40));
     expect(github.calls.filter((call) => call.startsWith('pull:'))).toHaveLength(3);
     expect(github.calls.filter((call) => call.endsWith(':.github/claude-review.json'))).toHaveLength(3);
@@ -279,14 +316,14 @@ describe('signed, durable event admission', () => {
     await send(service, revocation, event);
     expect(store.current('200', 42)?.state).toBe('superseded');
     github.revoked = true;
-    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access|revoked/i);
+    await expect(send(service, payload('synchronize', {}, github.live.headSha))).rejects.toThrow(/access|revoked/i);
     expect(store.claim(Date.now())).toBeNull();
   });
   it('handles delayed close delivery using fresh live state without cancelling a reopened head', async () => {
     const { store, github, service } = setup();
     await send(service, payload());
     github.live.headSha = 'f'.repeat(40);
-    await send(service, payload('synchronize'));
+    await send(service, payload('synchronize', {}, github.live.headSha));
     await send(service, payload('closed'));
     expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { headSha: 'f'.repeat(40) } });
   });
@@ -313,7 +350,7 @@ describe('signed, durable event admission', () => {
       if (path === 'AGENTS.md') { store.setAccess('100', null, false); github.revoked = true; }
       return value;
     };
-    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access revoked/i);
+    await expect(send(service, payload('synchronize', {}, github.live.headSha))).rejects.toThrow(/access revoked/i);
     expect(store.claim(Date.now())).toBeNull();
     expect(store.observation('200', 42).generation).toBe(2);
   });
@@ -438,7 +475,7 @@ describe('signed, durable event admission', () => {
     github.live.headSha = 'f'.repeat(40);
     await service.reconcileInstalled();
     expect(store.observation('200', 42).blockedReason).toBe('actor_provenance_unknown');
-    await send(service, payload('synchronize'));
+    await send(service, payload('synchronize', {}, github.live.headSha));
     expect(store.current('200', 42)).toMatchObject({ state: 'queued', identity: { headSha: 'f'.repeat(40) } });
   });
   it('recovers a delayed removal delivery and admits a later head without another re-add event', async () => {
@@ -448,14 +485,14 @@ describe('signed, durable event admission', () => {
     await send(service, removal, 'installation_repositories');
     await send(service, payload('added', { repositories_added: [{ id: 200 }] }), 'installation_repositories');
     github.live.headSha = 'f'.repeat(40);
-    await send(service, payload('synchronize'));
+    await send(service, payload('synchronize', {}, github.live.headSha));
     const previous = store.current('200', 42)?.identity;
     await send(service, removal, 'installation_repositories');
     await service.reconcilePull('200', 42);
     expect(store.accessAllowed('100', '200')).toBe(true);
     expect(store.current('200', 42)).toMatchObject({ state: 'superseded', identity: previous });
     github.live.headSha = 'd'.repeat(40);
-    expect((await send(service, payload('synchronize'))).kind).toBe('admitted');
+    expect((await send(service, payload('synchronize', {}, github.live.headSha))).kind).toBe('admitted');
   });
   it('lets an authorized explicit rerun verify restored access without restoring the cancelled attempt', async () => {
     const { store, service } = setup();
@@ -477,7 +514,7 @@ describe('signed, durable event admission', () => {
       github.revoked = true;
       return snapshot;
     };
-    await expect(send(service, payload('synchronize'))).rejects.toThrow(/access revoked/i);
+    await expect(send(service, payload('synchronize', {}, github.live.headSha))).rejects.toThrow(/access revoked/i);
     expect(store.accessAllowed('100', '200')).toBe(false);
     expect(store.current('200', 42)?.state).toBe('superseded');
   });
@@ -542,7 +579,7 @@ it('fails closed with missing repository metadata and accepts a verified default
   expect(github.calls.filter(call=>call.startsWith('file:'))).toEqual([]);
   github.defaultBranch='trunk';github.live.baseRef='trunk';
   github.files.set('.github/claude-review.json',JSON.stringify({...policy,baseBranches:['trunk']}));
-  await send(service,payload('synchronize'));
+  await send(service,payload('synchronize', {}, github.live.headSha));
   expect(await send(service,{installation:{id:100},repository:{id:200},sender:{login:'human',type:'User'},action:'created',issue:{number:42,pull_request:{}},comment:{id:9898,body:'/claude-review rerun',user:{login:'human',type:'User'}}},'issue_comment')).toMatchObject({kind:'admitted'});
 });
 
@@ -565,11 +602,11 @@ it('expires orphan comment and check receipts while preserving tracked open and 
     await send(service,comment(42),'issue_comment','orphan-comment');
     await send(service,payload('completed',{check_run:{id:502,app:{id:999},pull_requests:[{number:42}]}}),'check_run','orphan-check');
     expect(github.calls).toEqual([]);expect(store.trackedPulls('100')).toEqual([]);
-    github.live={...pull,pullNumber:43};await send(service,payload('opened',{number:43,pull_request:{number:43}}));
+    github.live={...pull,pullNumber:43};await send(service,payload('opened',{number:43,pull_request:{number:43,head:{sha:pull.headSha}}}));
     await send(service,comment(43),'issue_comment','open-comment');
-    github.live={...pull,pullNumber:44};await send(service,payload('opened',{number:44,pull_request:{number:44}}));
+    github.live={...pull,pullNumber:44};await send(service,payload('opened',{number:44,pull_request:{number:44,head:{sha:pull.headSha}}}));
     await send(service,comment(44),'issue_comment','closed-comment');
-    now=start+10*day;github.live.state='closed';await send(service,payload('closed',{number:44,pull_request:{number:44}}));
+    now=start+10*day;github.live.state='closed';await send(service,payload('closed',{number:44,pull_request:{number:44,head:{sha:pull.headSha}}}));
     const retention=createRetention({store});now=start+29*day;await retention.purgeExpired(now);
     expect(store.receipt('orphan-comment')).not.toBeNull();expect(store.receipt('orphan-check')).not.toBeNull();
     now=start+30*day;await retention.purgeExpired(now);

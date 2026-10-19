@@ -31,7 +31,7 @@ async function setup(files = 1) {
   };
   const admission = createAdmissionService({ store, github, webhookSecret: 'synthetic', appId: '5', ownerIds: ['4'], runtimeHash: 'e'.repeat(64), now: () => now });
   async function admit() {
-    const body = JSON.stringify({ action: 'synchronize', installation: { id: 1 }, repository: { id: 2 }, number: 3, pull_request: { number: 3 }, sender: { login: 'human', type: 'User' } });
+    const body = JSON.stringify({ action: 'synchronize', installation: { id: 1 }, repository: { id: 2 }, number: 3, pull_request: { number: 3, head: { sha: live.headSha } }, sender: { login: 'human', type: 'User' } });
     await admission.admitWebhook({ 'x-github-event': 'pull_request', 'x-github-delivery': `delivery-${now++}`, 'x-hub-signature-256': `sha256=${createHmac('sha256', 'synthetic').update(body).digest('hex')}` }, Buffer.from(body));
   }
   await admit();
