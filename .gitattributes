@@ -1,0 +1,4 @@
+worker/** text eol=lf
+test/fixtures/*.sh text eol=lf
+test/fixtures/*.mjs text eol=lf
+test/fixtures/*Dockerfile text eol=lf

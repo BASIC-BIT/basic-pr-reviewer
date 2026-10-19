@@ -1,0 +1,1 @@
+{"disableAllHooks":true,"permissions":{"allow":["Read","Glob","Grep"],"deny":["Bash","PowerShell","Edit","Write","WebFetch","WebSearch","Agent","mcp__*"]}}
